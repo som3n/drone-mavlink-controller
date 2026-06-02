@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+drone_env/
+venv/
+env/
+.venv/
+
+# Logs and telemetry (generated at runtime)
+logs/
+
+# Config overrides (keep examples, ignore local tweaks)
+config/local_*.yaml
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Distribution
+*.egg
+*.whl

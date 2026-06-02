@@ -1,0 +1,6 @@
+pymavlink
+pyserial
+pyyaml
+pytest
+flake8
+matplotlib
