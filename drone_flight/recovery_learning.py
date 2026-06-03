@@ -63,6 +63,7 @@ def evaluate_recovery_performance(event_data):
     stability_score = event_data.get("stability_score", 0.0)
     auth_factor = event_data.get("authority_factor", 0.0)
     success = event_data.get("success", False)
+    recoverable = event_data.get("recoverable", True)
 
     # 1. Quality scoring formula
     recovery_score = (duration * 0.5) + (overshoot * 0.3) + (stability_score * 0.2)
@@ -78,7 +79,8 @@ def evaluate_recovery_performance(event_data):
 
     log.info(
         f"  [RECOVERY LEARNING] Quality: {quality} (Score: {recovery_score:.2f}) | "
-        f"Dur: {duration:.2f}s Overshoot: {overshoot:.1f}° Stability: {stability_score:.1f}"
+        f"Dur: {duration:.2f}s Overshoot: {overshoot:.1f}° Stability: {stability_score:.1f} | "
+        f"Recoverable: {recoverable}"
     )
 
     # Load learning database
@@ -93,44 +95,47 @@ def evaluate_recovery_performance(event_data):
         kd_old = learning_data[zone_key]["kd"]
         kp_new, kd_new = kp_old, kd_old
 
-        # Rule-based adaptation rules
-        # Rule 4: Excellent recovery — no change
-        is_excellent = duration < 1.0 and overshoot < 2.0 and stability_score < 15.0
+        if recoverable:
+            # Rule-based adaptation rules
+            # Rule 4: Excellent recovery — no change
+            is_excellent = duration < 1.0 and overshoot < 2.0 and stability_score < 15.0
 
-        if not is_excellent:
-            # Rule 1: Slow Recovery
-            if duration > 2.5:
-                kp_new += 0.10
-                log.info("  [LEARNING RULE] Duration > 2.5s -> KP += 0.10")
+            if not is_excellent:
+                # Rule 1: Slow Recovery
+                if duration > 2.5:
+                    kp_new += 0.10
+                    log.info("  [LEARNING RULE] Duration > 2.5s -> KP += 0.10")
 
-            # Rule 2: Excessive Overshoot
-            if overshoot > 5.0:
-                kd_new += 0.05
-                log.info("  [LEARNING RULE] Overshoot > 5.0° -> KD += 0.05")
+                # Rule 2: Excessive Overshoot
+                if overshoot > 5.0:
+                    kd_new += 0.05
+                    log.info("  [LEARNING RULE] Overshoot > 5.0° -> KD += 0.05")
 
-            # Rule 3: Oscillation Detected
-            if stability_score > 40.0:
-                kp_new -= 0.05
-                kd_new += 0.05
+                # Rule 3: Oscillation Detected
+                if stability_score > 40.0:
+                    kp_new -= 0.05
+                    kd_new += 0.05
+                    log.info(
+                        "  [LEARNING RULE] Stability > 40 -> KP -= 0.05, KD += 0.05"
+                    )
+
+            # 2. Gain safety limits enforcement
+            kp_new = round(max(KP_MIN, min(KP_MAX, kp_new)), 3)
+            kd_new = round(max(KD_MIN, min(KD_MAX, kd_new)), 3)
+
+            # Update database values
+            learning_data[zone_key]["kp"] = kp_new
+            learning_data[zone_key]["kd"] = kd_new
+            learning_data[zone_key]["samples"] += 1
+            save_controller_learning(learning_data)
+
+            if kp_new != kp_old or kd_new != kd_old:
                 log.info(
-                    "  [LEARNING RULE] Stability > 40 -> KP -= 0.05, KD += 0.05"
+                    f"  [LEARNING UPDATE] Optimized {zone_key} gains: "
+                    f"KP: {kp_old} -> {kp_new} | KD: {kd_old} -> {kd_new}"
                 )
-
-        # 2. Gain safety limits enforcement
-        kp_new = round(max(KP_MIN, min(KP_MAX, kp_new)), 3)
-        kd_new = round(max(KD_MIN, min(KD_MAX, kd_new)), 3)
-
-        # Update database values
-        learning_data[zone_key]["kp"] = kp_new
-        learning_data[zone_key]["kd"] = kd_new
-        learning_data[zone_key]["samples"] += 1
-        save_controller_learning(learning_data)
-
-        if kp_new != kp_old or kd_new != kd_old:
-            log.info(
-                f"  [LEARNING UPDATE] Optimized {zone_key} gains: "
-                f"KP: {kp_old} -> {kp_new} | KD: {kd_old} -> {kd_new}"
-            )
+        else:
+            log.info("  [RECOVERY LEARNING] Bench test mode: skipping parameter adaptation updates.")
 
     # 3. CSV Dataset logging for future research
     try:
@@ -152,7 +157,7 @@ def evaluate_recovery_performance(event_data):
                 round(overshoot, 2),
                 round(stability_score, 2),
                 round(auth_factor, 2),
-                success
+                "BENCH_VALIDATION" if not recoverable else success
             ])
     except Exception as e:
         log.warning(f"Failed to log recovery learning event to CSV: {e}")
@@ -161,5 +166,6 @@ def evaluate_recovery_performance(event_data):
         "recovery_score": recovery_score,
         "quality": quality,
         "kp": kp_new,
-        "kd": kd_new
+        "kd": kd_new,
+        "learning_status": "SKIPPED" if not recoverable else "LEARNED"
     }

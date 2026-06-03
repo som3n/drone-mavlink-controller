@@ -268,7 +268,7 @@ def generate_post_flight_report(flight_start, dt, hover_altitudes_list):
         log.warning(f"Error saving flight analytics report: {e}")
 
 
-def calculate_attitude_recovery(target_roll, target_pitch, dt):
+def calculate_attitude_recovery(target_roll, target_pitch, dt, bench=False):
     roll, pitch = telem.get_attitude()
     roll_rate, pitch_rate = telem.get_attitude_rates()
 
@@ -463,12 +463,20 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
                         "overshoot": active_event["overshoot"],
                         "stability_score": avg_stability,
                         "authority_factor": avg_auth,
-                        "success": True
+                        "success": True,
+                        "recoverable": not bench
                     }
 
                     # Trigger learning evaluation and update gains in cache
                     res = evaluate_recovery_performance(event_data)
                     telem.state.controller_learning = load_controller_learning()
+
+                    if not event_data["recoverable"]:
+                        result_str = "BENCH_VALIDATION"
+                        learning_info = " | Learning: SKIPPED"
+                    else:
+                        result_str = f"SUCCESS (Score: {res['recovery_score']:.1f}, {res['quality']})"
+                        learning_info = ""
 
                     summary = (
                         f"Recovery Event #{active_event['event_number']} | "
@@ -476,7 +484,7 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
                         f"Peak Pitch Error: {event_data['peak_pitch_error']:.1f}° | "
                         f"Overshoot: {event_data['overshoot']:.1f}° | "
                         f"Duration: {duration:.2f}s | "
-                        f"Result: SUCCESS (Score: {res['recovery_score']:.1f}, {res['quality']})"
+                        f"Result: {result_str}{learning_info}"
                     )
                     telem.state.recovery_analytics_summary.append(summary)
                     log.info(f"  [RECOVERY ANALYTICS] {summary}")
@@ -498,11 +506,19 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
                     "overshoot": active_event["overshoot"],
                     "stability_score": avg_stability,
                     "authority_factor": avg_auth,
-                    "success": False
+                    "success": False,
+                    "recoverable": not bench
                 }
 
                 res = evaluate_recovery_performance(event_data)
                 telem.state.controller_learning = load_controller_learning()
+
+                if not event_data["recoverable"]:
+                    result_str = "BENCH_VALIDATION"
+                    learning_info = " | Learning: SKIPPED"
+                else:
+                    result_str = f"FAILED (Score: {res['recovery_score']:.1f})"
+                    learning_info = ""
 
                 summary = (
                     f"Recovery Event #{active_event['event_number']} | "
@@ -510,7 +526,7 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
                     f"Peak Pitch Error: {event_data['peak_pitch_error']:.1f}° | "
                     f"Overshoot: {event_data['overshoot']:.1f}° | "
                     f"Duration: {duration:.2f}s | "
-                    f"Result: FAILED (Score: {res['recovery_score']:.1f})"
+                    f"Result: {result_str}{learning_info}"
                 )
                 telem.state.recovery_analytics_summary.append(summary)
                 log.warning(f"  [RECOVERY ANALYTICS] {summary}")
@@ -542,7 +558,7 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
     )
 
 
-def send_throttle_safe(master, target_pct, phase, dt):
+def send_throttle_safe(master, target_pct, phase, dt, bench=False):
     # 1. Throttle Output Rate Limiter (Smooth Ramping)
     current = telem.current_throttle
     max_throttle_step = 1.5  # Max change ±1.5% per iteration (15% per second)
@@ -558,7 +574,7 @@ def send_throttle_safe(master, target_pct, phase, dt):
         roll_rate, pitch_rate,
         roll_corr, pitch_corr,
         stability_score, recovery_state
-    ) = calculate_attitude_recovery(target_roll, target_pitch, dt)
+    ) = calculate_attitude_recovery(target_roll, target_pitch, dt, bench=bench)
 
     with telem.state.lock:
         telem.state.roll_err = roll_err
@@ -730,7 +746,7 @@ def run_flight(config_path="config/bench_test.yaml"):
             if check_abort("spinup"):
                 abort_and_land(master, "spinup", bench)
                 return
-            send_throttle_safe(master, 10, "spinup", dt)
+            send_throttle_safe(master, 10, "spinup", dt, bench=bench)
             update_and_log_framework("spinup", 10, dt, hm)
             time.sleep(0.1)
 
@@ -741,7 +757,7 @@ def run_flight(config_path="config/bench_test.yaml"):
                 if check_abort("stabilize"):
                     abort_and_land(master, "stabilize", bench)
                     return
-                send_throttle_safe(master, pct, "stabilize", dt)
+                send_throttle_safe(master, pct, "stabilize", dt, bench=bench)
                 update_and_log_framework("stabilize", pct, dt, hm)
                 time.sleep(0.1)
 
@@ -756,7 +772,7 @@ def run_flight(config_path="config/bench_test.yaml"):
                 if check_abort("ramp"):
                     abort_and_land(master, "ramp", bench)
                     return
-                send_throttle_safe(master, pct, "ramp", dt)
+                send_throttle_safe(master, pct, "ramp", dt, bench=bench)
                 update_and_log_framework("ramp", pct, dt, hm)
                 time.sleep(0.1)
                 if hover_throttle is None and pct >= 30:
@@ -805,7 +821,7 @@ def run_flight(config_path="config/bench_test.yaml"):
             if alt is not None:
                 hover_altitudes_list.append(alt)
 
-            send_throttle_safe(master, cmd_throttle, "hover", dt)
+            send_throttle_safe(master, cmd_throttle, "hover", dt, bench=bench)
             update_and_log_framework("hover", cmd_throttle, dt, hm)
             time.sleep(0.1)
 

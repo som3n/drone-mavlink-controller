@@ -167,3 +167,40 @@ def test_gain_clamping():
         res = evaluate_recovery_performance(slow_event)
 
     assert res["kp"] == 25.0
+
+
+def test_bench_validation_no_learning():
+    # If recoverable is False, learning must be skipped and gains unmodified
+    event_data = {
+        "zone": 3,
+        "duration": 4.0,  # exceeds 2.5s -> would trigger Rule 1 (KP += 0.10)
+        "overshoot": 6.0,  # exceeds 5.0 -> would trigger Rule 2 (KD += 0.05)
+        "stability_score": 45.0,  # exceeds 40 -> would trigger Rule 3 (KP -= 0.05, KD += 0.05)
+        "authority_factor": 0.5,
+        "success": False,
+        "recoverable": False
+    }
+
+    # Initial gains for Zone 3 are KP=8.0, KD=1.5
+    res = evaluate_recovery_performance(event_data)
+    assert res["kp"] == 8.0
+    assert res["kd"] == 1.5
+    assert res["learning_status"] == "SKIPPED"
+
+    # Database values must remain unmodified
+    data = load_controller_learning()
+    assert data["zone3"]["kp"] == 8.0
+    assert data["zone3"]["kd"] == 1.5
+    assert data["zone3"]["samples"] == 0
+
+    # Entry must be logged to CSV with success = "BENCH_VALIDATION"
+    assert os.path.exists(DATASET_FILE)
+    with open(DATASET_FILE, "r") as f:
+        lines = f.readlines()
+        # header + 1 row
+        assert len(lines) >= 2
+        last_row = lines[-1].strip().split(",")
+        assert last_row[1] == "3"
+        assert last_row[2] == "8.0"
+        assert last_row[3] == "1.5"
+        assert last_row[8] == "BENCH_VALIDATION"
