@@ -13,6 +13,7 @@ class VehicleState:
         self.armed = False
         self.mode_id = None
         self.alt = 0.0
+        self.alt_offset = None
         self.climb = 0.0
         self.roll = 0.0
         self.pitch = 0.0
@@ -50,12 +51,14 @@ def send_rc_throttle(master, pct: float, phase="unknown", roll=1500, pitch=1500,
 def telemetry_reader_loop(master, stop_event):
     global state
     log.info("Telemetry reader thread started.")
+    consecutive_errors = 0
     while not stop_event.is_set():
         try:
             msg = master.recv_match(blocking=True, timeout=0.1)
             if msg is None:
                 continue
 
+            consecutive_errors = 0  # Reset on successful read
             msg_type = msg.get_type()
             now = time.time()
 
@@ -64,12 +67,20 @@ def telemetry_reader_loop(master, stop_event):
 
                 if msg_type == 'HEARTBEAT':
                     state.heartbeat_received = True
+                    was_armed = state.armed
                     state.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                     state.mode_id = msg.custom_mode
+                    if state.armed and not was_armed:
+                        state.alt_offset = None
 
                 elif msg_type == 'VFR_HUD':
-                    state.alt = msg.alt
                     state.climb = msg.climb
+
+                elif msg_type == 'GLOBAL_POSITION_INT':
+                    raw_alt = msg.relative_alt / 1000.0
+                    if state.alt_offset is None:
+                        state.alt_offset = raw_alt
+                    state.alt = max(0.0, raw_alt - state.alt_offset)
 
                 elif msg_type == 'ATTITUDE':
                     state.roll = math.degrees(msg.roll)
@@ -87,8 +98,15 @@ def telemetry_reader_loop(master, stop_event):
                     log.warning(f"DRONE MSG: {msg.text}")
 
         except Exception as e:
+            consecutive_errors += 1
             if not stop_event.is_set():
-                log.error(f"Telemetry reader error: {e}")
+                log.error(f"Telemetry reader error: {e} (consecutive: {consecutive_errors})")
+                if consecutive_errors >= 5:
+                    log.error("Too many consecutive telemetry errors — signaling safety abort and exiting thread.")
+                    from drone_flight.safety_monitor import abort_mission, abort_reason
+                    abort_reason = "telemetry connection dead"
+                    abort_mission.set()
+                    break
             time.sleep(0.5)
     log.info("Telemetry reader thread exited.")
 
@@ -96,6 +114,10 @@ def telemetry_reader_loop(master, stop_event):
 def start_telemetry_reader(master, stop_event):
     with state.lock:
         state.last_msg_time = time.time()
+        state.alt_offset = None
+    # Flush connection buffer to discard stale pre-start messages
+    while master.recv_match(blocking=False) is not None:
+        pass
     telemetry_reader_loop(master, stop_event)
 
 
@@ -145,14 +167,32 @@ def set_mode(master, mode_name: str):
         mode_id
     )
     for _ in range(20):
-        ack = master.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
-        if ack and ack.custom_mode == mode_id:
-            log.info(f"Mode {mode_name} confirmed.")
-            return
-    log.warning(f"Mode {mode_name} not confirmed — continuing.")
+        # 1. Check thread-safe vehicle state
+        with state.lock:
+            if state.mode_id == mode_id:
+                log.info(f"Mode {mode_name} confirmed.")
+                return
+            has_reader = state.heartbeat_received
+
+        # 2. If the telemetry reader thread is running, we wait for it to update the state
+        if has_reader:
+            time.sleep(0.1)
+        else:
+            # Fallback: read directly from connection if reader thread not started
+            ack = master.recv_match(type='HEARTBEAT', blocking=True, timeout=0.1)
+            if ack:
+                with state.lock:
+                    state.mode_id = ack.custom_mode
+                    state.armed = bool(ack.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                if ack.custom_mode == mode_id:
+                    log.info(f"Mode {mode_name} confirmed.")
+                    return
 
 
 def arm(master, bench_test: bool):
+    # Send 0% throttle command immediately to ensure safety before sending arm command
+    send_rc_throttle(master, 0, "arming")
+
     if bench_test:
         log.info("Force-arming (bench test)...")
         master.mav.command_long_send(
@@ -161,7 +201,10 @@ def arm(master, bench_test: bool):
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 1, 21196, 0, 0, 0, 0, 0
         )
-        time.sleep(2)
+        # Keep sending 0% throttle during 2-second force-arming wait
+        for _ in range(20):
+            send_rc_throttle(master, 0, "arming")
+            time.sleep(0.1)
         master.mav.command_long_send(
             master.target_system,
             master.target_component,
@@ -173,13 +216,13 @@ def arm(master, bench_test: bool):
         master.arducopter_arm()
 
     log.info("Waiting for armed state...")
-    time.sleep(2)
     for _ in range(30):
-        hb = master.recv_match(type='HEARTBEAT', blocking=True, timeout=1)
+        # Actively maintain 0% throttle override while waiting for armed confirmation
+        send_rc_throttle(master, 0, "arming")
+        hb = master.recv_match(type='HEARTBEAT', blocking=True, timeout=0.2)
         if hb and (hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
             log.info("Armed successfully.")
             return
-        time.sleep(0.2)
     log.warning("Arm confirmation not received — continuing anyway.")
 
 

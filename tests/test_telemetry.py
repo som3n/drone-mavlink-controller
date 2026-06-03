@@ -5,6 +5,7 @@ def test_vehicle_state_initialization():
     state = telem.state
     assert state.armed is False
     assert state.alt == 0.0
+    assert state.alt_offset is None
     assert state.climb == 0.0
     assert state.roll == 0.0
     assert state.pitch == 0.0
@@ -42,3 +43,62 @@ def test_getters_under_state_updates():
     assert x == 1.0
     assert y == 2.0
     assert z == 9.8
+
+
+def test_telemetry_reader_loop_global_position_int():
+    class MockMessage:
+        def __init__(self, type_name, **kwargs):
+            self._type = type_name
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+        def get_type(self):
+            return self._type
+
+    import threading
+    stop_event = threading.Event()
+
+    class MockMaster:
+        def __init__(self):
+            self.messages = [
+                MockMessage('GLOBAL_POSITION_INT', relative_alt=1500), # first sets offset to 1.5m
+                MockMessage('GLOBAL_POSITION_INT', relative_alt=2500), # updates relative alt to 2.5 - 1.5 = 1.0m
+                MockMessage('VFR_HUD', climb=0.25)
+            ]
+
+        def recv_match(self, blocking=True, timeout=0.1):
+            if self.messages:
+                return self.messages.pop(0)
+            stop_event.set()
+            return None
+
+    # Reset state to default values before test
+    with telem.state.lock:
+        telem.state.alt = 0.0
+        telem.state.alt_offset = None
+        telem.state.climb = 0.0
+
+    master = MockMaster()
+    telem.telemetry_reader_loop(master, stop_event)
+
+    alt, climb = telem.get_vfr_hud()
+    assert alt == 1.0
+    assert climb == 0.25
+
+
+def test_telemetry_reader_loop_consecutive_errors():
+    import threading
+    stop_event = threading.Event()
+
+    class FailingMaster:
+        def recv_match(self, blocking=True, timeout=0.1):
+            raise IOError("Connection lost")
+
+    from drone_flight.safety_monitor import abort_mission
+    abort_mission.clear()
+
+    master = FailingMaster()
+    telem.telemetry_reader_loop(master, stop_event)
+
+    assert abort_mission.is_set()
+

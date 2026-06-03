@@ -1,0 +1,33 @@
+bench_test: false
+port:
+  windows: COM7
+  linux: /dev/ttyUSB0
+  baud: 57600
+
+flight:
+  battery_min_voltage: 10.5
+  known_hover_throttle_pct: 50
+  liftoff_alt_m: 0.10
+  liftoff_climb_rate: 0.02
+  hover_hold_sec: 3.0
+  descent_step_pct: 5
+  descent_step_hold_sec: 2.0
+  land_alt_threshold_m: 0.10
+  land_final_throttle: 10
+  land_final_hold_sec: 2.0
+
+safety:
+  crash_accel_g: 4.0
+  crash_roll_deg: 60
+  crash_pitch_deg: 60
+  telemetry_timeout_sec: 5.0
+  max_flight_sec: 60
+  battery_min_voltage: 10.5
+
+takeoff_ramp:
+  - [25, 2]
+  - [30, 2]
+  - [35, 2]
+  - [40, 2]
+  - [45, 2]
+  - [50, 2]

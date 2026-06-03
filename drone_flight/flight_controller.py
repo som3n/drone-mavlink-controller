@@ -2,6 +2,7 @@ import time
 import platform
 import threading
 import yaml
+import math
 
 from pymavlink import mavutil
 from drone_flight.logger import log, log_telemetry, close_logger
@@ -49,7 +50,7 @@ def send_throttle_safe(master, target_pct, phase):
     pitch_cmd = 1500
 
     # Proportional correction to actively level the drone if it tilts
-    if roll is not None and pitch is not None:
+    if roll is not None and pitch is not None and not (math.isnan(roll) or math.isnan(pitch)):
         max_tilt = max(abs(roll), abs(pitch))
         # Only apply active leveling if the tilt is significant (>= 5.0 degrees)
         # to prevent motor unbalancing on the ground/bench during flat idle
@@ -86,7 +87,10 @@ def run_flight(config_path="config/bench_test.yaml"):
 
     try:
         log.info("Waiting for heartbeat...")
-        master.wait_heartbeat()
+        hb = master.wait_heartbeat(timeout=10.0)
+        if hb is None:
+            log.error("Timeout waiting for heartbeat. Check port connection and power.")
+            return
         log.info(f"Heartbeat OK — system {master.target_system}")
 
         # Request data streams
@@ -101,9 +105,59 @@ def run_flight(config_path="config/bench_test.yaml"):
         )
         master.mav.request_data_stream_send(
             master.target_system, master.target_component,
-            mavutil.mavlink.MAV_DATA_STREAM_POSITION, 10, 1  # VFR_HUD
+            mavutil.mavlink.MAV_DATA_STREAM_POSITION, 10, 1  # VFR_HUD / GLOBAL_POSITION_INT
         )
         time.sleep(1)
+
+        # Set fake GPS Global Origin and Home Position to initialize EKF origin and zero altitude
+        log.info("Initializing EKF origin and home position...")
+        lat = int(12.9716 * 1e7)
+        lon = int(77.5946 * 1e7)
+        origin_alt = 500.0  # 500m default origin
+
+        master.mav.set_gps_global_origin_send(
+            master.target_system,
+            lat,
+            lon,
+            int(origin_alt * 1000)
+        )
+        time.sleep(0.5)
+
+        # Wait and read EKF altitude to zero the home relative altitude
+        ekf_alt = None
+        for _ in range(20):
+            msg = master.recv_match(blocking=True, timeout=0.1)
+            if msg and msg.get_type() == 'GLOBAL_POSITION_INT':
+                ekf_alt = msg.alt / 1000.0
+                break
+        
+        if ekf_alt is None:
+            # Fallback to VFR_HUD
+            for _ in range(20):
+                msg = master.recv_match(type='VFR_HUD', blocking=True, timeout=0.1)
+                if msg:
+                    ekf_alt = msg.alt
+                    break
+
+        if ekf_alt is None:
+            log.warning("Could not read EKF altitude — using default origin altitude.")
+            ekf_alt = origin_alt
+
+        master.mav.command_long_send(
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_HOME,
+            0,    # confirmation
+            0,    # param 1: 0 = use specified lat/lon/alt
+            0,    # param 2: unused
+            0,    # param 3: unused
+            0,    # param 4: unused
+            12.9716,  # param 5: latitude
+            77.5946,  # param 6: longitude
+            ekf_alt   # param 7: altitude
+        )
+        log.info(f"EKF origin and home initialized (zero altitude: {ekf_alt:.2f}m).")
+        time.sleep(0.5)
 
         # Check battery voltage if connected (both in bench and real flight)
         volts = telem.get_battery_voltage(master)
@@ -186,45 +240,46 @@ def run_flight(config_path="config/bench_test.yaml"):
             log_telemetry("hover", hover_throttle, alt, climb, roll, pitch)
             time.sleep(0.1)
 
-        # ── PHASE 5: Descent ──────────────────────────────────
-        log.info("PHASE: Descent")
-        step = 1
-        while True:
-            if check_abort("descent"):
-                abort_and_land(master, "descent"); return
-            throttle = max(hover_throttle - (fc["descent_step_pct"] * step), 10)
-            log.info(f"  Descent step {step}: {throttle}%")
-            for _ in range(int(fc["descent_step_hold_sec"] / 0.1)):
-                if check_abort("descent hold"):
-                    abort_and_land(master, "descent hold"); return
-                send_throttle_safe(master, throttle, "descent")
-                alt, climb = telem.get_vfr_hud()
-                roll, pitch = telem.get_attitude()
-                log_telemetry("descent", throttle, alt, climb, roll, pitch)
-                time.sleep(0.1)
-            alt, _ = telem.get_vfr_hud()
-            if (alt is not None and alt < fc["land_alt_threshold_m"]) or throttle <= 10:
-                break
-            step += 1
+        # ── PHASE 5: Land Mode ────────────────────────────────
+        log.info("PHASE: Initializing autonomous LAND mode...")
+        # Clear RC overrides to return control to the autopilot
+        master.mav.rc_channels_override_send(
+            master.target_system, master.target_component,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        telem.set_mode(master, "LAND")
 
-        # ── PHASE 6: Land ─────────────────────────────────────
-        log.info("PHASE: Landing")
-        for _ in range(50):
-            if check_abort("land confirm"):
-                abort_and_land(master, "land confirm"); return
+        log.info("Waiting for landing confirmation (disarm)...")
+        land_start = time.time()
+        while True:
+            if check_abort("landing"):
+                abort_and_land(master, "landing"); return
+
+            # Read and log telemetry
             alt, climb = telem.get_vfr_hud()
             roll, pitch = telem.get_attitude()
-            log_telemetry("land", fc["land_final_throttle"], alt, climb, roll, pitch)
-            if alt is not None and climb is not None:
-                if alt < fc["land_alt_threshold_m"] and abs(climb) < 0.05:
-                    log.info(f"Ground confirmed: alt={alt:.2f}m climb={climb:.2f}m/s")
-                    break
+            log_telemetry("land", 0, alt, climb, roll, pitch)
+
+            # Check if disarmed
+            with telem.state.lock:
+                is_armed = telem.state.armed
+
+            if not is_armed:
+                log.info("Ground confirmed: Disarmed successfully.")
+                break
+
+            # Extra safety timeout: 5s for bench test (no propellers to trigger landing detection), 30s for real flight
+            timeout_limit = 5.0 if bench else 30.0
+            if time.time() - land_start > timeout_limit:
+                if bench:
+                    log.info("Bench test landing timeout completed — disarming motors.")
+                else:
+                    log.warning("Landing timeout exceeded — force-disarming!")
+                telem.disarm(master)
+                break
+
             time.sleep(0.1)
 
-        telem.send_rc_throttle(master, fc["land_final_throttle"], "land")
-        time.sleep(fc["land_final_hold_sec"])
-        telem.send_rc_throttle(master, 0, "land")
-        telem.disarm(master)
         log.info("Flight sequence complete.")
 
     except KeyboardInterrupt:
@@ -239,6 +294,8 @@ def run_flight(config_path="config/bench_test.yaml"):
         raise
 
     finally:
+        # Signal safety monitor thread to exit
+        abort_mission.set()
         if 'stop_reader' in locals():
             stop_reader.set()
         if 'reader_thread' in locals():
@@ -247,4 +304,6 @@ def run_flight(config_path="config/bench_test.yaml"):
 
 
 if __name__ == "__main__":
-    run_flight()
+    import sys
+    config_file = sys.argv[1] if len(sys.argv) > 1 else "config/bench_test.yaml"
+    run_flight(config_file)

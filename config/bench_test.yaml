@@ -21,7 +21,7 @@ safety:
   crash_roll_deg: 60
   crash_pitch_deg: 60
   telemetry_timeout_sec: 5.0
-  max_flight_sec: 60
+  max_flight_sec: 120
   battery_min_voltage: 10.5
 
 takeoff_ramp:
