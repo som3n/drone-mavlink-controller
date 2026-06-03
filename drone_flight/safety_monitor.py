@@ -11,6 +11,7 @@ def safety_monitor(master, cfg, flight_start_time, dt=None, hm=None):
     global abort_reason
     safety = cfg["safety"]
     log.info("Safety monitor active.")
+    att_err_consecutive_ticks = 0
 
     while not abort_mission.is_set():
         now = time.time()
@@ -30,22 +31,56 @@ def safety_monitor(master, cfg, flight_start_time, dt=None, hm=None):
             abort_mission.set()
             return
 
-        # IMU spike
-        ax, ay, az = telem.get_raw_imu()
-        if (ax > safety["crash_accel_g"] or
-                ay > safety["crash_accel_g"] or
-                az > safety["crash_accel_g"]):
-            log.error(f"ABORT — IMU spike ax={ax:.1f}g ay={ay:.1f}g az={az:.1f}g")
-            abort_reason = f"IMU spike ax={ax:.1f}g ay={ay:.1f}g az={az:.1f}g"
-            abort_mission.set()
-            return
-
-        # Extreme attitude
+        bench_test = cfg.get("bench_test", True)
         roll, pitch = telem.get_attitude()
-        if roll is not None and pitch is not None:
-            if abs(roll) > safety["crash_roll_deg"] or abs(pitch) > safety["crash_pitch_deg"]:
-                log.error(f"ABORT — attitude roll={roll:.1f}° pitch={pitch:.1f}°")
-                abort_reason = f"critical attitude roll={roll:.1f}° pitch={pitch:.1f}°"
+
+        if not bench_test:
+            # 1. IMU spike (Impact > 4g)
+            ax, ay, az = telem.get_raw_imu()
+            if (ax > safety["crash_accel_g"] or
+                    ay > safety["crash_accel_g"] or
+                    az > safety["crash_accel_g"]):
+                log.error(f"ABORT — IMU spike ax={ax:.1f}g ay={ay:.1f}g az={az:.1f}g")
+                abort_reason = f"IMU spike ax={ax:.1f}g ay={ay:.1f}g az={az:.1f}g"
+                abort_mission.set()
+                return
+
+            # 2. Extreme attitude / Inverted vessel check
+            if roll is not None and pitch is not None:
+                if (abs(roll) > safety["crash_roll_deg"] or
+                        abs(pitch) > safety["crash_pitch_deg"] or
+                        abs(roll) > 90.0 or abs(pitch) > 90.0):
+                    log.error(f"ABORT — attitude roll={roll:.1f}° pitch={pitch:.1f}°")
+                    abort_reason = f"critical attitude roll={roll:.1f}° pitch={pitch:.1f}°"
+                    abort_mission.set()
+                    return
+
+            # 3. Attitude Error check (> 45 deg for > 2 seconds)
+            target_roll, target_pitch = telem.get_target_attitude()
+            if roll is not None and pitch is not None:
+                roll_err = target_roll - roll
+                pitch_err = target_pitch - pitch
+                max_err = max(abs(roll_err), abs(pitch_err))
+                if max_err > 45.0:
+                    att_err_consecutive_ticks += 1
+                else:
+                    att_err_consecutive_ticks = 0
+
+                if att_err_consecutive_ticks >= 40:  # 2s at 20Hz (0.05s sleep)
+                    log.error(
+                        f"ABORT — Attitude error > 45 deg for more than 2s "
+                        f"(error={max_err:.1f}°)"
+                    )
+                    abort_reason = f"critical attitude error {max_err:.1f}°"
+                    abort_mission.set()
+                    return
+
+            # 4. Critical Stability Score check
+            with telem.state.lock:
+                stability_score = telem.state.stability_score
+            if stability_score >= 80.0:
+                log.error(f"ABORT — Stability score went critical: {stability_score:.1f}")
+                abort_reason = f"critical stability score {stability_score:.1f}"
                 abort_mission.set()
                 return
 

@@ -18,10 +18,20 @@ class VehicleState:
         self.climb = 0.0
         self.roll = 0.0
         self.pitch = 0.0
+        self.target_roll = 0.0
+        self.target_pitch = 0.0
+        self.rollspeed = 0.0
+        self.pitchspeed = 0.0
         self.voltage_battery = 0.0
         self.xacc = 0.0
         self.yacc = 0.0
         self.zacc = 0.0
+        self.roll_err = 0.0
+        self.pitch_err = 0.0
+        self.roll_corr = 0.0
+        self.pitch_corr = 0.0
+        self.stability_score = 0.0
+        self.recovery_state = "NORMAL"
         self.heartbeat_received = False
 
 
@@ -86,6 +96,8 @@ def telemetry_reader_loop(master, stop_event):
                 elif msg_type == 'ATTITUDE':
                     state.roll = math.degrees(msg.roll)
                     state.pitch = math.degrees(msg.pitch)
+                    state.rollspeed = math.degrees(msg.rollspeed)
+                    state.pitchspeed = math.degrees(msg.pitchspeed)
 
                 elif msg_type == 'SYS_STATUS':
                     state.voltage_battery = msg.voltage_battery / 1000.0
@@ -151,6 +163,22 @@ def get_vfr_hud(master=None):
 def get_attitude(master=None):
     with state.lock:
         return state.roll, state.pitch
+
+
+def get_target_attitude():
+    with state.lock:
+        return state.target_roll, state.target_pitch
+
+
+def set_target_attitude(roll, pitch):
+    with state.lock:
+        state.target_roll = roll
+        state.target_pitch = pitch
+
+
+def get_attitude_rates():
+    with state.lock:
+        return state.rollspeed, state.pitchspeed
 
 
 def get_raw_imu():

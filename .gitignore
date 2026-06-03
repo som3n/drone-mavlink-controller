@@ -40,3 +40,6 @@ htmlcov/
 # Distribution
 *.egg
 *.whl
+
+# Learned flight parameters
+config/learned_params.json

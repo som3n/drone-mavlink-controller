@@ -2,7 +2,6 @@ import time
 import platform
 import threading
 import yaml
-import math
 import json
 import os
 from datetime import datetime
@@ -90,11 +89,29 @@ def update_and_log_framework(phase, throttle, dt, hm):
     bat_state = dt.predict_battery_state()
     pred_volt_rem = bat_state["remaining_voltage"]
 
+    # Read Attitude Recovery state variables
+    with telem.state.lock:
+        target_roll = telem.state.target_roll
+        target_pitch = telem.state.target_pitch
+        roll_err = telem.state.roll_err
+        pitch_err = telem.state.pitch_err
+        roll_rate = telem.state.rollspeed
+        pitch_rate = telem.state.pitchspeed
+        roll_corr = telem.state.roll_corr
+        pitch_corr = telem.state.pitch_corr
+        stability_score = telem.state.stability_score
+        recovery_state = telem.state.recovery_state
+
     log_telemetry(
         phase, throttle, alt, climb, roll, pitch,
         health=health, anomaly_score=anomaly_score, risk_score=risk_score,
         pred_alt_1s=pred_alt_1s, pred_alt_3s=pred_alt_3s, pred_alt_5s=pred_alt_5s,
-        pred_volt_rem=pred_volt_rem
+        pred_volt_rem=pred_volt_rem,
+        target_roll=target_roll, roll_err=roll_err,
+        target_pitch=target_pitch, pitch_err=pitch_err,
+        roll_rate=roll_rate, pitch_rate=pitch_rate,
+        roll_corr=roll_corr, pitch_corr=pitch_corr,
+        stability_score=stability_score, recovery_state=recovery_state
     )
 
 
@@ -188,34 +205,124 @@ def generate_post_flight_report(flight_start, dt, hover_altitudes_list):
         log.warning(f"Error saving flight analytics report: {e}")
 
 
-def send_throttle_safe(master, target_pct, phase):
-    # Retrieve current attitude
+def calculate_attitude_recovery(target_roll, target_pitch, dt):
     roll, pitch = telem.get_attitude()
+    roll_rate, pitch_rate = telem.get_attitude_rates()
 
-    roll_cmd = 1500
-    pitch_cmd = 1500
+    if roll is None or pitch is None or roll_rate is None or pitch_rate is None:
+        return 1500, 1500, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, "NORMAL"
 
-    # Proportional correction to actively level the drone if it tilts
-    if roll is not None and pitch is not None and not (math.isnan(roll) or math.isnan(pitch)):
-        max_tilt = max(abs(roll), abs(pitch))
-        # Only apply active leveling if the tilt is significant (>= 5.0 degrees)
-        # to prevent motor unbalancing on the ground/bench during flat idle
-        if max_tilt >= 5.0:
-            # P-controller to counter tilt (gain Kp = 8.0 PWM units per degree)
-            Kp = 8.0
-            roll_cmd = 1500 - (Kp * roll)
-            pitch_cmd = 1500 - (Kp * pitch)
+    # 1. Error calculation
+    roll_err = target_roll - roll
+    pitch_err = target_pitch - pitch
+    max_err = max(abs(roll_err), abs(pitch_err))
 
-            # Clamp overrides to safe range [1300, 1700] to prevent extreme inputs
-            roll_cmd = max(1300, min(1700, int(roll_cmd)))
-            pitch_cmd = max(1300, min(1700, int(pitch_cmd)))
+    # 2. Stability Zones Evaluation
+    if max_err <= 5.0:
+        kp_factor = 0.0
+        kd_factor = 0.0
+        recovery_state = "NORMAL"
+    elif max_err <= 10.0:
+        kp_factor = 0.5
+        kd_factor = 0.5
+        recovery_state = "MINOR CORRECTION"
+    elif max_err <= 20.0:
+        kp_factor = 1.0
+        kd_factor = 1.0
+        recovery_state = "ACTIVE RECOVERY"
+    elif max_err <= 35.0:
+        kp_factor = 1.5
+        kd_factor = 1.0
+        recovery_state = "HIGH RECOVERY"
+    else:
+        kp_factor = 2.0
+        kd_factor = 1.0
+        recovery_state = "RECOVERY MODE"
 
-            # Log a warning if the tilt is significant (>15 degrees)
-            if max_tilt > 15.0:
-                log.warning(
-                    f"  [TILT WARNING] roll={roll:.1f}° pitch={pitch:.1f}° "
-                    f"| Applying correction: Roll={roll_cmd} Pitch={pitch_cmd}"
-                )
+    # PD Controller Gains
+    KP = 8.0 * kp_factor
+    KD = 1.5 * kd_factor
+
+    # PD correction formulas (damping positive rates)
+    roll_corr = KP * roll_err - KD * roll_rate
+    pitch_corr = KP * pitch_err - KD * pitch_rate
+
+    # Clamp corrections to safe range [-200, 200]
+    roll_corr = max(-200.0, min(200.0, roll_corr))
+    pitch_corr = max(-200.0, min(200.0, pitch_corr))
+
+    # Add corrections to neutral (1500)
+    roll_cmd = int(1500 + roll_corr)
+    pitch_cmd = int(1500 + pitch_corr)
+
+    # 3. Stability Score Calculation (0 to 100)
+    if max_err <= 5.0:
+        att_score = 0.0
+    else:
+        att_score = min(30.0, (max_err - 5.0) / 30.0 * 30.0)
+
+    rolls = dt.history["roll"]
+    pitches = dt.history["pitch"]
+
+    def calculate_variance(data):
+        if len(data) < 2:
+            return 0.0
+        avg = sum(data) / len(data)
+        return sum((x - avg) ** 2 for x in data) / len(data)
+
+    roll_var = calculate_variance(rolls)
+    pitch_var = calculate_variance(pitches)
+
+    roll_var_score = min(20.0, (roll_var / 5.0) * 20.0)
+    pitch_var_score = min(20.0, (pitch_var / 5.0) * 20.0)
+
+    max_rate = max(abs(roll_rate), abs(pitch_rate))
+    if max_rate <= 10.0:
+        rate_score = 0.0
+    else:
+        rate_score = min(30.0, (max_rate - 10.0) / 90.0 * 30.0)
+
+    stability_score = att_score + roll_var_score + pitch_var_score + rate_score
+    stability_score = min(100.0, max(0.0, stability_score))
+
+    # Update state variables
+    with telem.state.lock:
+        telem.state.stability_score = stability_score
+        telem.state.recovery_state = recovery_state
+
+    return (
+        roll_cmd, pitch_cmd,
+        roll_err, pitch_err,
+        roll_rate, pitch_rate,
+        roll_corr, pitch_corr,
+        stability_score, recovery_state
+    )
+
+
+def send_throttle_safe(master, target_pct, phase, dt):
+    target_roll, target_pitch = telem.get_target_attitude()
+
+    (
+        roll_cmd, pitch_cmd,
+        roll_err, pitch_err,
+        roll_rate, pitch_rate,
+        roll_corr, pitch_corr,
+        stability_score, recovery_state
+    ) = calculate_attitude_recovery(target_roll, target_pitch, dt)
+
+    with telem.state.lock:
+        telem.state.roll_err = roll_err
+        telem.state.pitch_err = pitch_err
+        telem.state.roll_corr = roll_corr
+        telem.state.pitch_corr = pitch_corr
+
+    # Log warnings for significant errors (ACTIVE RECOVERY or worse)
+    if recovery_state in ["ACTIVE RECOVERY", "HIGH RECOVERY", "RECOVERY MODE"]:
+        log.warning(
+            f"  [ATTITUDE WARNING] State: {recovery_state} | "
+            f"Roll Error: {roll_err:.1f}° Pitch Error: {pitch_err:.1f}° | "
+            f"Corrections: Roll={roll_cmd} Pitch={pitch_cmd}"
+        )
 
     telem.send_rc_throttle(master, target_pct, phase, roll=roll_cmd, pitch=pitch_cmd)
 
@@ -354,13 +461,16 @@ def run_flight(config_path="config/bench_test.yaml"):
         )
         monitor.start()
 
+        # Initialize target attitude
+        telem.set_target_attitude(0.0, 0.0)
+
         # ── PHASE 1: Spin-up ──────────────────────────────────
         log.info("PHASE: Spin-up 10% x 5s")
         for _ in range(50):
             if check_abort("spinup"):
                 abort_and_land(master, "spinup", bench)
                 return
-            send_throttle_safe(master, 10, "spinup")
+            send_throttle_safe(master, 10, "spinup", dt)
             update_and_log_framework("spinup", 10, dt, hm)
             time.sleep(0.1)
 
@@ -371,7 +481,7 @@ def run_flight(config_path="config/bench_test.yaml"):
                 if check_abort("stabilize"):
                     abort_and_land(master, "stabilize", bench)
                     return
-                send_throttle_safe(master, pct, "stabilize")
+                send_throttle_safe(master, pct, "stabilize", dt)
                 update_and_log_framework("stabilize", pct, dt, hm)
                 time.sleep(0.1)
 
@@ -386,7 +496,7 @@ def run_flight(config_path="config/bench_test.yaml"):
                 if check_abort("ramp"):
                     abort_and_land(master, "ramp", bench)
                     return
-                send_throttle_safe(master, pct, "ramp")
+                send_throttle_safe(master, pct, "ramp", dt)
                 update_and_log_framework("ramp", pct, dt, hm)
                 time.sleep(0.1)
                 if hover_throttle is None and pct >= 30:
@@ -435,7 +545,7 @@ def run_flight(config_path="config/bench_test.yaml"):
             if alt is not None:
                 hover_altitudes_list.append(alt)
 
-            send_throttle_safe(master, cmd_throttle, "hover")
+            send_throttle_safe(master, cmd_throttle, "hover", dt)
             update_and_log_framework("hover", cmd_throttle, dt, hm)
             time.sleep(0.1)
 
