@@ -12,6 +12,7 @@ from drone_flight import telemetry as telem
 from drone_flight.safety_monitor import safety_monitor, abort_mission
 from drone_flight.digital_twin import DigitalTwin
 from drone_flight.health_monitor import HealthMonitor, std_dev
+from drone_flight.recovery_learning import load_controller_learning, evaluate_recovery_performance
 
 
 def load_config(path="config/bench_test.yaml"):
@@ -214,6 +215,29 @@ def generate_post_flight_report(flight_start, dt, hover_altitudes_list):
     else:
         recovery_section += "Recovery Events Summary: None\n"
 
+    learning_data = load_controller_learning()
+    learning_report = (
+        f"==================================================\n"
+        f"SELF-LEARNING CONTROLLER REPORT\n"
+        f"==================================================\n"
+        f"Zone 2\n"
+        f"KP: {learning_data['zone2']['kp']:.3f}\n"
+        f"KD: {learning_data['zone2']['kd']:.3f}\n"
+        f"Samples: {learning_data['zone2']['samples']}\n\n"
+        f"Zone 3\n"
+        f"KP: {learning_data['zone3']['kp']:.3f}\n"
+        f"KD: {learning_data['zone3']['kd']:.3f}\n"
+        f"Samples: {learning_data['zone3']['samples']}\n\n"
+        f"Zone 4\n"
+        f"KP: {learning_data['zone4']['kp']:.3f}\n"
+        f"KD: {learning_data['zone4']['kd']:.3f}\n"
+        f"Samples: {learning_data['zone4']['samples']}\n\n"
+        f"Zone 5\n"
+        f"KP: {learning_data['zone5']['kp']:.3f}\n"
+        f"KD: {learning_data['zone5']['kd']:.3f}\n"
+        f"Samples: {learning_data['zone5']['samples']}\n"
+    )
+
     report = (
         f"==================================================\n"
         f"                FLIGHT ANALYTICS REPORT           \n"
@@ -227,6 +251,7 @@ def generate_post_flight_report(flight_start, dt, hover_altitudes_list):
         f"Battery Consumed:        {bat_used:.2f}V\n"
         f"--------------------------------------------------\n"
         f"{recovery_section}"
+        f"{learning_report}"
         f"==================================================\n"
     )
 
@@ -294,40 +319,50 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
     pred_stability_2s = pred["pred_stability_2s"]
     pred_success_prob = pred["recovery_success_prob"]
 
+    # Load learned controller gains from VehicleState cache
+    with telem.state.lock:
+        learning_data = telem.state.controller_learning
+    if learning_data is None:
+        learning_data = load_controller_learning()
+        with telem.state.lock:
+            telem.state.controller_learning = learning_data
+
     # 6. Adaptive Gain Scheduling & Authority Levels
     if max_err <= 5.0:
         auth_factor = 0.0
-        kp_mult = 1.0
-        kd_mult = 1.0
+        KP = 0.0
+        KD = 0.0
         recovery_state = "NORMAL"
+        event_zone = 1
     elif max_err <= 10.0:
         auth_factor = 0.25
-        kp_mult = 1.0
-        kd_mult = 1.0
+        KP = learning_data["zone2"]["kp"]
+        KD = learning_data["zone2"]["kd"]
         recovery_state = "MINOR CORRECTION"
+        event_zone = 2
     elif max_err <= 20.0:
         auth_factor = 0.50
-        kp_mult = 1.0
-        kd_mult = 1.0
+        KP = learning_data["zone3"]["kp"]
+        KD = learning_data["zone3"]["kd"]
         recovery_state = "ACTIVE RECOVERY"
+        event_zone = 3
     elif max_err <= 35.0:
         auth_factor = 0.75
-        kp_mult = 1.5
-        kd_mult = 1.2
+        KP = learning_data["zone4"]["kp"]
+        KD = learning_data["zone4"]["kd"]
         recovery_state = "HIGH RECOVERY"
+        event_zone = 4
     else:
         auth_factor = 1.00
-        kp_mult = 2.0
-        kd_mult = 1.5
+        KP = learning_data["zone5"]["kp"]
+        KD = learning_data["zone5"]["kd"]
         recovery_state = "RECOVERY MODE"
+        event_zone = 5
 
     # Predictive boost if success probability is below 50%
-    if pred_success_prob < 50.0:
-        kp_mult *= 1.2
-        kd_mult *= 1.1
-
-    KP = 8.0 * kp_mult
-    KD = 1.5 * kd_mult
+    if pred_success_prob < 50.0 and max_err > 5.0:
+        KP *= 1.2
+        KD *= 1.1
 
     # 7. Recovery Authority Manager Scaling
     roll_output = KP * roll_err - KD * roll_rate
@@ -356,7 +391,7 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
     pitch_delta = max(-20.0, min(20.0, pitch_delta))
     pitch_cmd = int(prev_pitch_cmd + pitch_delta)
 
-    # 9. Recovery Performance Analytics Tracking
+    # 9. Recovery Performance Analytics Tracking & Gain Adaptation
     now_time = time.time()
     with telem.state.lock:
         active_event = telem.state.active_recovery_event
@@ -366,47 +401,116 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
                 # Start new event
                 active_event = {
                     "start_time": now_time,
+                    "max_zone": event_zone,
                     "peak_roll_err": abs(roll_err),
                     "peak_pitch_err": abs(pitch_err),
-                    "event_number": telem.state.recovery_events_count + 1
+                    "event_number": telem.state.recovery_events_count + 1,
+                    "has_crossed_target": False,
+                    "overshoot": 0.0,
+                    "stability_scores": [stability_score],
+                    "authority_factors": [auth_factor],
+                    "stable_ticks": 0
                 }
                 telem.state.recovery_events_count += 1
                 telem.state.active_recovery_event = active_event
                 log.info(
                     f"  [RECOVERY ANALYTICS] Started Recovery Event "
-                    f"#{active_event['event_number']}"
+                    f"#{active_event['event_number']} for Zone {event_zone}"
                 )
             else:
+                active_event["max_zone"] = max(active_event["max_zone"], event_zone)
                 active_event["peak_roll_err"] = max(
                     active_event["peak_roll_err"], abs(roll_err)
                 )
                 active_event["peak_pitch_err"] = max(
                     active_event["peak_pitch_err"], abs(pitch_err)
                 )
+                active_event["stability_scores"].append(stability_score)
+                active_event["authority_factors"].append(auth_factor)
+                active_event["stable_ticks"] = 0  # reset stable window
+
+                # Track overshoot if target has been crossed
+                if not active_event["has_crossed_target"]:
+                    if abs(roll_err) <= 5.0 and abs(pitch_err) <= 5.0:
+                        active_event["has_crossed_target"] = True
+                else:
+                    curr_err = max(abs(roll_err), abs(pitch_err))
+                    active_event["overshoot"] = max(active_event["overshoot"], curr_err)
         else:
             if active_event is not None:
-                # End active event successfully
-                duration = now_time - active_event["start_time"]
-                summary = (
-                    f"Recovery Event #{active_event['event_number']} | "
-                    f"Peak Roll Error: {active_event['peak_roll_err']:.1f}° | "
-                    f"Peak Pitch Error: {active_event['peak_pitch_err']:.1f}° | "
-                    f"Recovery Duration: {duration:.2f}s | Result: SUCCESS"
-                )
-                telem.state.recovery_analytics_summary.append(summary)
-                log.info(f"  [RECOVERY ANALYTICS] {summary}")
-                telem.state.active_recovery_event = None
-                active_event = None
+                active_event["stable_ticks"] += 1
+                active_event["stability_scores"].append(stability_score)
+                active_event["authority_factors"].append(auth_factor)
 
-        # Check for timeout (FAILED)
+                # Track overshoot if target crossed
+                if not active_event["has_crossed_target"]:
+                    active_event["has_crossed_target"] = True
+                else:
+                    curr_err = max(abs(roll_err), abs(pitch_err))
+                    active_event["overshoot"] = max(active_event["overshoot"], curr_err)
+
+                # Event ends successfully when attitude remains in Zone 1 for 5 ticks (0.5s)
+                if active_event["stable_ticks"] >= 5:
+                    duration = now_time - active_event["start_time"]
+                    avg_stability = sum(active_event["stability_scores"]) / len(active_event["stability_scores"])
+                    avg_auth = sum(active_event["authority_factors"]) / len(active_event["authority_factors"])
+
+                    event_data = {
+                        "zone": active_event["max_zone"],
+                        "duration": duration,
+                        "peak_roll_error": active_event["peak_roll_err"],
+                        "peak_pitch_error": active_event["peak_pitch_err"],
+                        "overshoot": active_event["overshoot"],
+                        "stability_score": avg_stability,
+                        "authority_factor": avg_auth,
+                        "success": True
+                    }
+
+                    # Trigger learning evaluation and update gains in cache
+                    res = evaluate_recovery_performance(event_data)
+                    telem.state.controller_learning = load_controller_learning()
+
+                    summary = (
+                        f"Recovery Event #{active_event['event_number']} | "
+                        f"Peak Roll Error: {event_data['peak_roll_error']:.1f}° | "
+                        f"Peak Pitch Error: {event_data['peak_pitch_error']:.1f}° | "
+                        f"Overshoot: {event_data['overshoot']:.1f}° | "
+                        f"Duration: {duration:.2f}s | "
+                        f"Result: SUCCESS (Score: {res['recovery_score']:.1f}, {res['quality']})"
+                    )
+                    telem.state.recovery_analytics_summary.append(summary)
+                    log.info(f"  [RECOVERY ANALYTICS] {summary}")
+                    telem.state.active_recovery_event = None
+                    active_event = None
+
+        # Check for event timeout (FAILED if duration exceeds 5.0 seconds)
         if active_event is not None:
             duration = now_time - active_event["start_time"]
             if duration > 5.0:
+                avg_stability = sum(active_event["stability_scores"]) / len(active_event["stability_scores"])
+                avg_auth = sum(active_event["authority_factors"]) / len(active_event["authority_factors"])
+
+                event_data = {
+                    "zone": active_event["max_zone"],
+                    "duration": duration,
+                    "peak_roll_error": active_event["peak_roll_err"],
+                    "peak_pitch_error": active_event["peak_pitch_err"],
+                    "overshoot": active_event["overshoot"],
+                    "stability_score": avg_stability,
+                    "authority_factor": avg_auth,
+                    "success": False
+                }
+
+                res = evaluate_recovery_performance(event_data)
+                telem.state.controller_learning = load_controller_learning()
+
                 summary = (
                     f"Recovery Event #{active_event['event_number']} | "
-                    f"Peak Roll Error: {active_event['peak_roll_err']:.1f}° | "
-                    f"Peak Pitch Error: {active_event['peak_pitch_err']:.1f}° | "
-                    f"Recovery Duration: {duration:.2f}s | Result: FAILED"
+                    f"Peak Roll Error: {event_data['peak_roll_error']:.1f}° | "
+                    f"Peak Pitch Error: {event_data['peak_pitch_error']:.1f}° | "
+                    f"Overshoot: {event_data['overshoot']:.1f}° | "
+                    f"Duration: {duration:.2f}s | "
+                    f"Result: FAILED (Score: {res['recovery_score']:.1f})"
                 )
                 telem.state.recovery_analytics_summary.append(summary)
                 log.warning(f"  [RECOVERY ANALYTICS] {summary}")
@@ -488,6 +592,11 @@ def run_flight(config_path="config/bench_test.yaml"):
     if learned_hover is not None:
         fc["known_hover_throttle_pct"] = learned_hover
         log.info(f"Overriding known hover throttle with learned value: {learned_hover}%")
+
+    # Load learned controller gains
+    learning_data = load_controller_learning()
+    with telem.state.lock:
+        telem.state.controller_learning = learning_data
 
     log.info(f"Platform: {platform.system()} | Mode: {'BENCH TEST' if bench else 'REAL FLIGHT'}")
 

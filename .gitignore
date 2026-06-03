@@ -43,3 +43,4 @@ htmlcov/
 
 # Learned flight parameters
 config/learned_params.json
+config/controller_learning.json

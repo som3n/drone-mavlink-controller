@@ -38,6 +38,7 @@ class VehicleState:
         self.recovery_events_count = 0
         self.active_recovery_event = None
         self.recovery_analytics_summary = []
+        self.controller_learning = None
         self.recovery_state = "NORMAL"
         self.heartbeat_received = False
 
