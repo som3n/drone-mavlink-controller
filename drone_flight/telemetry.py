@@ -31,6 +31,13 @@ class VehicleState:
         self.roll_corr = 0.0
         self.pitch_corr = 0.0
         self.stability_score = 0.0
+        self.attitude_error_score = 0.0
+        self.flight_risk = 0.0
+        self.prev_roll_cmd = 1500
+        self.prev_pitch_cmd = 1500
+        self.recovery_events_count = 0
+        self.active_recovery_event = None
+        self.recovery_analytics_summary = []
         self.recovery_state = "NORMAL"
         self.heartbeat_received = False
 

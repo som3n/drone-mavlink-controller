@@ -80,7 +80,6 @@ def update_and_log_framework(phase, throttle, dt, hm):
     health = hm.calculate_health_scores(dt)
     anomalies = hm.detect_anomalies(dt)
     anomaly_score = anomalies["anomaly_score"]
-    risk_score = dt.get_flight_risk_score()
 
     pred_alt_1s = dt.predict_future_altitude(1.0)
     pred_alt_3s = dt.predict_future_altitude(3.0)
@@ -88,7 +87,6 @@ def update_and_log_framework(phase, throttle, dt, hm):
 
     bat_state = dt.predict_battery_state()
     pred_volt_rem = bat_state["remaining_voltage"]
-
     # Read Attitude Recovery state variables
     with telem.state.lock:
         target_roll = telem.state.target_roll
@@ -101,6 +99,17 @@ def update_and_log_framework(phase, throttle, dt, hm):
         pitch_corr = telem.state.pitch_corr
         stability_score = telem.state.stability_score
         recovery_state = telem.state.recovery_state
+        att_err_score = telem.state.attitude_error_score
+        flight_risk = telem.state.flight_risk
+        pred_roll_err_1s = getattr(telem.state, "pred_roll_err_1s", 0.0)
+        pred_pitch_err_1s = getattr(telem.state, "pred_pitch_err_1s", 0.0)
+        pred_stability_2s = getattr(telem.state, "pred_stability_2s", 0.0)
+        pred_success_prob = getattr(telem.state, "pred_success_prob", 100.0)
+        auth_factor = getattr(telem.state, "auth_factor", 0.0)
+        kp_scaled = getattr(telem.state, "kp_scaled", 8.0)
+        kd_scaled = getattr(telem.state, "kd_scaled", 1.5)
+
+    risk_score = dt.get_flight_risk_score(att_err_score, stability_score)
 
     log_telemetry(
         phase, throttle, alt, climb, roll, pitch,
@@ -111,7 +120,11 @@ def update_and_log_framework(phase, throttle, dt, hm):
         target_pitch=target_pitch, pitch_err=pitch_err,
         roll_rate=roll_rate, pitch_rate=pitch_rate,
         roll_corr=roll_corr, pitch_corr=pitch_corr,
-        stability_score=stability_score, recovery_state=recovery_state
+        stability_score=stability_score, recovery_state=recovery_state,
+        att_err_score=att_err_score, flight_risk=flight_risk,
+        pred_roll_err_1s=pred_roll_err_1s, pred_pitch_err_1s=pred_pitch_err_1s,
+        pred_stability_2s=pred_stability_2s, pred_success_prob=pred_success_prob,
+        auth_factor=auth_factor, kp_scaled=kp_scaled, kd_scaled=kd_scaled
     )
 
 
@@ -178,6 +191,29 @@ def generate_post_flight_report(flight_start, dt, hover_altitudes_list):
     if voltages and voltages[0] > 1.0:
         bat_used = max(0.0, voltages[0] - voltages[-1])
 
+    with telem.state.lock:
+        summaries = list(telem.state.recovery_analytics_summary)
+        active_event = telem.state.active_recovery_event
+
+    if active_event is not None:
+        event_duration = time.time() - active_event["start_time"]
+        summary = (
+            f"Recovery Event #{active_event['event_number']} | "
+            f"Peak Roll Error: {active_event['peak_roll_err']:.1f}° | "
+            f"Peak Pitch Error: {active_event['peak_pitch_err']:.1f}° | "
+            f"Recovery Duration: {event_duration:.2f}s | "
+            f"Result: FAILED (End of Flight)"
+        )
+        summaries.append(summary)
+
+    recovery_section = ""
+    if summaries:
+        recovery_section += "Recovery Events Summary:\n"
+        for line in summaries:
+            recovery_section += f"  - {line}\n"
+    else:
+        recovery_section += "Recovery Events Summary: None\n"
+
     report = (
         f"==================================================\n"
         f"                FLIGHT ANALYTICS REPORT           \n"
@@ -189,6 +225,8 @@ def generate_post_flight_report(flight_start, dt, hover_altitudes_list):
         f"Maximum Roll:            {max_roll:.1f}°\n"
         f"Maximum Pitch:           {max_pitch:.1f}°\n"
         f"Battery Consumed:        {bat_used:.2f}V\n"
+        f"--------------------------------------------------\n"
+        f"{recovery_section}"
         f"==================================================\n"
     )
 
@@ -217,50 +255,11 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
     pitch_err = target_pitch - pitch
     max_err = max(abs(roll_err), abs(pitch_err))
 
-    # 2. Stability Zones Evaluation
-    if max_err <= 5.0:
-        kp_factor = 0.0
-        kd_factor = 0.0
-        recovery_state = "NORMAL"
-    elif max_err <= 10.0:
-        kp_factor = 0.5
-        kd_factor = 0.5
-        recovery_state = "MINOR CORRECTION"
-    elif max_err <= 20.0:
-        kp_factor = 1.0
-        kd_factor = 1.0
-        recovery_state = "ACTIVE RECOVERY"
-    elif max_err <= 35.0:
-        kp_factor = 1.5
-        kd_factor = 1.0
-        recovery_state = "HIGH RECOVERY"
-    else:
-        kp_factor = 2.0
-        kd_factor = 1.0
-        recovery_state = "RECOVERY MODE"
-
-    # PD Controller Gains
-    KP = 8.0 * kp_factor
-    KD = 1.5 * kd_factor
-
-    # PD correction formulas (damping positive rates)
-    roll_corr = KP * roll_err - KD * roll_rate
-    pitch_corr = KP * pitch_err - KD * pitch_rate
-
-    # Clamp corrections to safe range [-200, 200]
-    roll_corr = max(-200.0, min(200.0, roll_corr))
-    pitch_corr = max(-200.0, min(200.0, pitch_corr))
-
-    # Add corrections to neutral (1500)
-    roll_cmd = int(1500 + roll_corr)
-    pitch_cmd = int(1500 + pitch_corr)
+    # 2. Separate Attitude Error Score (0-100)
+    attitude_error = abs(roll_err) + abs(pitch_err)
+    att_err_score = min(100.0, (attitude_error / 45.0) * 100.0)
 
     # 3. Stability Score Calculation (0 to 100)
-    if max_err <= 5.0:
-        att_score = 0.0
-    else:
-        att_score = min(30.0, (max_err - 5.0) / 30.0 * 30.0)
-
     rolls = dt.history["roll"]
     pitches = dt.history["pitch"]
 
@@ -273,22 +272,162 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
     roll_var = calculate_variance(rolls)
     pitch_var = calculate_variance(pitches)
 
-    roll_var_score = min(20.0, (roll_var / 5.0) * 20.0)
-    pitch_var_score = min(20.0, (pitch_var / 5.0) * 20.0)
+    roll_var_score = min(30.0, (roll_var / 5.0) * 30.0)
+    pitch_var_score = min(30.0, (pitch_var / 5.0) * 30.0)
 
     max_rate = max(abs(roll_rate), abs(pitch_rate))
-    if max_rate <= 10.0:
-        rate_score = 0.0
-    else:
-        rate_score = min(30.0, (max_rate - 10.0) / 90.0 * 30.0)
+    rate_score = min(40.0, (max_rate / 90.0) * 40.0)
 
-    stability_score = att_score + roll_var_score + pitch_var_score + rate_score
+    stability_score = roll_var_score + pitch_var_score + rate_score
     stability_score = min(100.0, max(0.0, stability_score))
+
+    # 4. Composite Flight Risk Engine
+    flight_risk = (att_err_score * 0.4) + (stability_score * 0.6)
+    flight_risk = min(100.0, max(0.0, flight_risk))
+
+    # 5. Digital Twin Predictive Recovery
+    pred = dt.predict_recovery_outcome(
+        roll_err, pitch_err, roll_rate, pitch_rate, stability_score
+    )
+    pred_roll_err_1s = pred["pred_roll_err_1s"]
+    pred_pitch_err_1s = pred["pred_pitch_err_1s"]
+    pred_stability_2s = pred["pred_stability_2s"]
+    pred_success_prob = pred["recovery_success_prob"]
+
+    # 6. Adaptive Gain Scheduling & Authority Levels
+    if max_err <= 5.0:
+        auth_factor = 0.0
+        kp_mult = 1.0
+        kd_mult = 1.0
+        recovery_state = "NORMAL"
+    elif max_err <= 10.0:
+        auth_factor = 0.25
+        kp_mult = 1.0
+        kd_mult = 1.0
+        recovery_state = "MINOR CORRECTION"
+    elif max_err <= 20.0:
+        auth_factor = 0.50
+        kp_mult = 1.0
+        kd_mult = 1.0
+        recovery_state = "ACTIVE RECOVERY"
+    elif max_err <= 35.0:
+        auth_factor = 0.75
+        kp_mult = 1.5
+        kd_mult = 1.2
+        recovery_state = "HIGH RECOVERY"
+    else:
+        auth_factor = 1.00
+        kp_mult = 2.0
+        kd_mult = 1.5
+        recovery_state = "RECOVERY MODE"
+
+    # Predictive boost if success probability is below 50%
+    if pred_success_prob < 50.0:
+        kp_mult *= 1.2
+        kd_mult *= 1.1
+
+    KP = 8.0 * kp_mult
+    KD = 1.5 * kd_mult
+
+    # 7. Recovery Authority Manager Scaling
+    roll_output = KP * roll_err - KD * roll_rate
+    pitch_output = KP * pitch_err - KD * pitch_rate
+
+    roll_corr = roll_output * auth_factor
+    pitch_corr = pitch_output * auth_factor
+
+    # Clamp corrections to safe range [-200, 200]
+    roll_corr = max(-200.0, min(200.0, roll_corr))
+    pitch_corr = max(-200.0, min(200.0, pitch_corr))
+
+    # 8. Recovery Output Rate Limiter (±20 max change per iteration)
+    with telem.state.lock:
+        prev_roll_cmd = telem.state.prev_roll_cmd
+        prev_pitch_cmd = telem.state.prev_pitch_cmd
+
+    desired_roll_pwm = int(1500 + roll_corr)
+    desired_pitch_pwm = int(1500 + pitch_corr)
+
+    roll_delta = desired_roll_pwm - prev_roll_cmd
+    roll_delta = max(-20.0, min(20.0, roll_delta))
+    roll_cmd = int(prev_roll_cmd + roll_delta)
+
+    pitch_delta = desired_pitch_pwm - prev_pitch_cmd
+    pitch_delta = max(-20.0, min(20.0, pitch_delta))
+    pitch_cmd = int(prev_pitch_cmd + pitch_delta)
+
+    # 9. Recovery Performance Analytics Tracking
+    now_time = time.time()
+    with telem.state.lock:
+        active_event = telem.state.active_recovery_event
+
+        if max_err > 5.0:
+            if active_event is None:
+                # Start new event
+                active_event = {
+                    "start_time": now_time,
+                    "peak_roll_err": abs(roll_err),
+                    "peak_pitch_err": abs(pitch_err),
+                    "event_number": telem.state.recovery_events_count + 1
+                }
+                telem.state.recovery_events_count += 1
+                telem.state.active_recovery_event = active_event
+                log.info(
+                    f"  [RECOVERY ANALYTICS] Started Recovery Event "
+                    f"#{active_event['event_number']}"
+                )
+            else:
+                active_event["peak_roll_err"] = max(
+                    active_event["peak_roll_err"], abs(roll_err)
+                )
+                active_event["peak_pitch_err"] = max(
+                    active_event["peak_pitch_err"], abs(pitch_err)
+                )
+        else:
+            if active_event is not None:
+                # End active event successfully
+                duration = now_time - active_event["start_time"]
+                summary = (
+                    f"Recovery Event #{active_event['event_number']} | "
+                    f"Peak Roll Error: {active_event['peak_roll_err']:.1f}° | "
+                    f"Peak Pitch Error: {active_event['peak_pitch_err']:.1f}° | "
+                    f"Recovery Duration: {duration:.2f}s | Result: SUCCESS"
+                )
+                telem.state.recovery_analytics_summary.append(summary)
+                log.info(f"  [RECOVERY ANALYTICS] {summary}")
+                telem.state.active_recovery_event = None
+                active_event = None
+
+        # Check for timeout (FAILED)
+        if active_event is not None:
+            duration = now_time - active_event["start_time"]
+            if duration > 5.0:
+                summary = (
+                    f"Recovery Event #{active_event['event_number']} | "
+                    f"Peak Roll Error: {active_event['peak_roll_err']:.1f}° | "
+                    f"Peak Pitch Error: {active_event['peak_pitch_err']:.1f}° | "
+                    f"Recovery Duration: {duration:.2f}s | Result: FAILED"
+                )
+                telem.state.recovery_analytics_summary.append(summary)
+                log.warning(f"  [RECOVERY ANALYTICS] {summary}")
+                telem.state.active_recovery_event = None
 
     # Update state variables
     with telem.state.lock:
         telem.state.stability_score = stability_score
+        telem.state.attitude_error_score = att_err_score
+        telem.state.flight_risk = flight_risk
         telem.state.recovery_state = recovery_state
+        telem.state.prev_roll_cmd = roll_cmd
+        telem.state.prev_pitch_cmd = pitch_cmd
+        # Save prediction variables for logging
+        telem.state.pred_roll_err_1s = pred_roll_err_1s
+        telem.state.pred_pitch_err_1s = pred_pitch_err_1s
+        telem.state.pred_stability_2s = pred_stability_2s
+        telem.state.pred_success_prob = pred_success_prob
+        telem.state.auth_factor = auth_factor
+        telem.state.kp_scaled = KP
+        telem.state.kd_scaled = KD
 
     return (
         roll_cmd, pitch_cmd,
@@ -300,6 +439,13 @@ def calculate_attitude_recovery(target_roll, target_pitch, dt):
 
 
 def send_throttle_safe(master, target_pct, phase, dt):
+    # 1. Throttle Output Rate Limiter (Smooth Ramping)
+    current = telem.current_throttle
+    max_throttle_step = 1.5  # Max change ±1.5% per iteration (15% per second)
+    delta = target_pct - current
+    delta = max(-max_throttle_step, min(max_throttle_step, delta))
+    actual_pct = current + delta
+
     target_roll, target_pitch = telem.get_target_attitude()
 
     (
@@ -324,7 +470,8 @@ def send_throttle_safe(master, target_pct, phase, dt):
             f"Corrections: Roll={roll_cmd} Pitch={pitch_cmd}"
         )
 
-    telem.send_rc_throttle(master, target_pct, phase, roll=roll_cmd, pitch=pitch_cmd)
+    # Use the smooth actual_pct instead of raw target_pct
+    telem.send_rc_throttle(master, actual_pct, phase, roll=roll_cmd, pitch=pitch_cmd)
 
 
 def run_flight(config_path="config/bench_test.yaml"):

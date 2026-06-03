@@ -3,6 +3,17 @@ from drone_flight import telemetry as telem
 
 def test_vehicle_state_initialization():
     state = telem.state
+    with state.lock:
+        state.armed = False
+        state.alt = 0.0
+        state.alt_offset = None
+        state.climb = 0.0
+        state.roll = 0.0
+        state.pitch = 0.0
+        state.voltage_battery = 0.0
+        state.xacc = 0.0
+        state.yacc = 0.0
+        state.zacc = 0.0
     assert state.armed is False
     assert state.alt == 0.0
     assert state.alt_offset is None

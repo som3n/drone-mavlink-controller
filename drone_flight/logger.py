@@ -29,7 +29,9 @@ _csv_writer.writerow([
     "pred_alt_1s", "pred_alt_3s", "pred_alt_5s", "pred_volt_rem",
     "target_roll", "roll_err", "target_pitch", "pitch_err",
     "roll_rate", "pitch_rate", "roll_corr", "pitch_corr",
-    "stability_score", "recovery_state"
+    "stability_score", "recovery_state", "att_err_score", "flight_risk",
+    "pred_roll_err_1s", "pred_pitch_err_1s", "pred_stability_2s",
+    "pred_success_prob", "auth_factor", "kp_scaled", "kd_scaled"
 ])
 
 
@@ -39,7 +41,11 @@ def log_telemetry(phase, throttle, alt=None, climb=None, roll=None, pitch=None,
                   pred_volt_rem=None, target_roll=0.0, roll_err=0.0,
                   target_pitch=0.0, pitch_err=0.0, roll_rate=0.0,
                   pitch_rate=0.0, roll_corr=0.0, pitch_corr=0.0,
-                  stability_score=0.0, recovery_state="NORMAL"):
+                  stability_score=0.0, recovery_state="NORMAL",
+                  att_err_score=0.0, flight_risk=0.0,
+                  pred_roll_err_1s=0.0, pred_pitch_err_1s=0.0,
+                  pred_stability_2s=0.0, pred_success_prob=100.0,
+                  auth_factor=0.0, kp_scaled=8.0, kd_scaled=1.5):
     h = health if health is not None else {}
     _csv_writer.writerow([
         round(time.time(), 3),
@@ -70,6 +76,15 @@ def log_telemetry(phase, throttle, alt=None, climb=None, roll=None, pitch=None,
         round(pitch_corr, 1),
         round(stability_score, 1),
         recovery_state,
+        round(att_err_score, 1),
+        round(flight_risk, 1),
+        round(pred_roll_err_1s, 2),
+        round(pred_pitch_err_1s, 2),
+        round(pred_stability_2s, 1),
+        round(pred_success_prob, 1),
+        round(auth_factor, 2),
+        round(kp_scaled, 2),
+        round(kd_scaled, 2)
     ])
     _csv_file.flush()
 

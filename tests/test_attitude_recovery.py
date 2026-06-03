@@ -95,3 +95,81 @@ def test_stability_score_critical():
         max_err=40.0, roll_var=6.0, pitch_var=6.0, max_rate=110.0
     )
     assert score >= 80.0
+
+
+def test_authority_manager_and_gain_scheduling():
+    from drone_flight.flight_controller import calculate_attitude_recovery
+    from drone_flight.digital_twin import DigitalTwin
+    from drone_flight import telemetry as telem
+
+    dt = DigitalTwin()
+    telem.set_target_attitude(0.0, 0.0)
+
+    # Mock attitude state in Zone 1 (Error <= 5.0) -> auth = 0.0
+    with telem.state.lock:
+        telem.state.roll = 4.0
+        telem.state.pitch = 0.0
+        telem.state.rollspeed = 2.0
+        telem.state.pitchspeed = 0.0
+        telem.state.prev_roll_cmd = 1500
+        telem.state.prev_pitch_cmd = 1500
+
+    roll_cmd, _, _, _, _, _, roll_corr, _, _, rec_state = calculate_attitude_recovery(0.0, 0.0, dt)
+    assert rec_state == "NORMAL"
+    assert roll_corr == 0.0
+    assert roll_cmd == 1500
+
+
+def test_rate_limiter():
+    from drone_flight.flight_controller import calculate_attitude_recovery
+    from drone_flight.digital_twin import DigitalTwin
+    from drone_flight import telemetry as telem
+
+    dt = DigitalTwin()
+
+    # Previous command is 1500. Large error demands desired_roll_pwm = 1300
+    # The rate limiter clamps change to -20, outputting 1480.
+    with telem.state.lock:
+        telem.state.roll = 50.0
+        telem.state.pitch = 0.0
+        telem.state.rollspeed = 0.0
+        telem.state.pitchspeed = 0.0
+        telem.state.prev_roll_cmd = 1500
+        telem.state.prev_pitch_cmd = 1500
+
+    roll_cmd, _, _, _, _, _, _, _, _, _ = calculate_attitude_recovery(0.0, 0.0, dt)
+    assert roll_cmd == 1480
+
+
+def test_throttle_rate_limiter():
+    from drone_flight.flight_controller import send_throttle_safe
+    from drone_flight.digital_twin import DigitalTwin
+    from drone_flight import telemetry as telem
+
+    dt = DigitalTwin()
+
+    class DummyMaster:
+        instance = None
+
+        def __init__(self):
+            self.target_system = 1
+            self.target_component = 1
+            self.sent_throttle = None
+            DummyMaster.instance = self
+
+        class mav:
+            @staticmethod
+            def rc_channels_override_send(sys, comp, c1, c2, throttle_pwm, *args):
+                DummyMaster.instance.sent_throttle = throttle_pwm
+
+    master = DummyMaster()
+    telem.current_throttle = 10.0
+    telem.state.prev_roll_cmd = 1500
+    telem.state.prev_pitch_cmd = 1500
+
+    # Demand 20.0% throttle. Change 10.0% -> 20.0% is +10.0%.
+    # Clamps to +1.5%, giving actual throttle of 11.5%.
+    send_throttle_safe(master, 20.0, "test", dt)
+
+    assert abs(telem.current_throttle - 11.5) < 1e-3
+    assert master.sent_throttle == 1192

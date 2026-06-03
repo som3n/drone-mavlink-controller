@@ -77,13 +77,10 @@ def test_stability_evaluation():
 
 def test_risk_score():
     dt = DigitalTwin()
-    dt.update(alt=0.0, climb=0.0, voltage=0.0, roll=0.0, pitch=0.0,
-              xacc=0.0, yacc=0.0, zacc=1.0)
+    # Safe condition: 10 * 0.4 + 20 * 0.6 = 16.0
+    risk = dt.get_flight_risk_score(attitude_error_score=10.0, stability_score=20.0)
+    assert abs(risk - 16.0) < 1e-3
 
-    # USB only, stable: risk should be near 0
-    assert dt.get_flight_risk_score() < 1.0
-
-    # High attitude tilt (50 degrees) should increase attitude risk
-    dt.update(alt=0.0, climb=0.0, voltage=0.0, roll=50.0, pitch=0.0,
-              xacc=0.0, yacc=0.0, zacc=1.0)
-    assert dt.get_flight_risk_score() >= 75.0
+    # Critical condition: 80 * 0.4 + 90 * 0.6 = 86.0
+    risk = dt.get_flight_risk_score(attitude_error_score=80.0, stability_score=90.0)
+    assert abs(risk - 86.0) < 1e-3

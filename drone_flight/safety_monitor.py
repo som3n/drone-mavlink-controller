@@ -115,7 +115,10 @@ def safety_monitor(master, cfg, flight_start_time, dt=None, hm=None):
             # 2. Predictive stability failure check (attitude drift / oscillation growth)
             stability_trends = dt.evaluate_stability_trends()
             if stability_trends["oscillation_growing"]:
-                risk = dt.get_flight_risk_score()
+                with telem.state.lock:
+                    att_err_score = telem.state.attitude_error_score
+                    stab_score = telem.state.stability_score
+                risk = dt.get_flight_risk_score(att_err_score, stab_score)
                 if risk > 80.0:
                     log.error("PREDICTIVE ABORT — Growing oscillations and high flight risk")
                     abort_reason = "predictive stability failure"

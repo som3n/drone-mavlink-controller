@@ -132,70 +132,33 @@ class DigitalTwin:
             "oscillation_growing": osc_growing,
         }
 
-    def get_flight_risk_score(self, current_time_sec=None):
-        # 1. Telemetry latency risk
-        now = time.time()
-        last_msg = self.history["time"][-1] if self.history["time"] else now
-        latency = now - last_msg
-        if latency <= 1.0:
-            latency_risk = 0.0
-        elif latency >= 5.0:
-            latency_risk = 100.0
-        else:
-            latency_risk = (latency - 1.0) / 4.0 * 100.0
+    def get_flight_risk_score(self, attitude_error_score=0.0, stability_score=0.0):
+        # Composite flight risk formula: 40% attitude error + 60% stability score
+        flight_risk = (attitude_error_score * 0.4) + (stability_score * 0.6)
+        return min(100.0, max(0.0, flight_risk))
 
-        # 2. Battery risk
-        bat_state = self.predict_battery_state()
-        v_now = self.history["voltage"][-1] if self.history["voltage"] else 0.0
-        if v_now <= 1.0:
-            # USB only - no battery risk
-            bat_risk = 0.0
-        else:
-            rem_sec = bat_state["remaining_flight_time_sec"]
-            if rem_sec <= 0.0:
-                bat_risk = 100.0
-            elif rem_sec <= 20.0:
-                bat_risk = 80.0 + (20.0 - rem_sec) / 20.0 * 20.0
-            elif rem_sec <= 60.0:
-                bat_risk = 30.0 + (60.0 - rem_sec) / 40.0 * 50.0
-            else:
-                bat_risk = max(0.0, 30.0 - (rem_sec - 60.0) / 120.0 * 30.0)
+    def predict_recovery_outcome(self, roll_err, pitch_err, roll_rate, pitch_rate, stability_score):
+        # 1. Projected Error after 1s (using rate of change of attitude)
+        # roll_rate and pitch_rate are in deg/s. roll_err_rate is -roll_rate
+        pred_roll_err_1s = roll_err - roll_rate * 1.0
+        pred_pitch_err_1s = pitch_err - pitch_rate * 1.0
+        pred_error_1s = abs(pred_roll_err_1s) + abs(pred_pitch_err_1s)
 
-        # 3. Attitude risk
-        roll = abs(self.history["roll"][-1]) if self.history["roll"] else 0.0
-        pitch = abs(self.history["pitch"][-1]) if self.history["pitch"] else 0.0
-        max_tilt = max(roll, pitch)
-        if max_tilt < 15.0:
-            att_risk = 0.0
-        elif max_tilt >= 60.0:
-            att_risk = 100.0
-        elif max_tilt >= 40.0:
-            att_risk = 50.0 + (max_tilt - 40.0) / 20.0 * 50.0
-        else:
-            att_risk = (max_tilt - 15.0) / 25.0 * 50.0
-
-        # 4. Instability risk
+        # 2. Projected Stability score after 2s
         trends = self.evaluate_stability_trends()
-        instability_risk = 0.0
         if trends["oscillation_growing"]:
-            instability_risk += 40.0
-        instability_risk += min(40.0, trends["drift_deg"] / 20.0 * 40.0)
-
-        # 5. G-force vibration risk
-        xacc = self.history["xacc"][-1] if self.history["xacc"] else 0.0
-        yacc = self.history["yacc"][-1] if self.history["yacc"] else 0.0
-        zacc = self.history["zacc"][-1] if self.history["zacc"] else 0.0
-        max_g = max(xacc, yacc, zacc)
-        if max_g < 2.0:
-            vib_risk = 0.0
-        elif max_g >= 4.0:
-            vib_risk = 100.0
+            pred_stability_2s = min(100.0, stability_score + 20.0)
         else:
-            vib_risk = (max_g - 2.0) / 2.0 * 100.0
+            pred_stability_2s = max(0.0, stability_score - 15.0)
 
-        # Overall risk: take maximum of critical risks, or weighted average of general risks
-        max_critical_risk = max(latency_risk, att_risk, vib_risk)
-        weighted_general_risk = (bat_risk * 0.4) + (instability_risk * 0.6)
+        # 3. Heuristic for Recovery success probability
+        success_prob = 100.0 - (pred_error_1s * 1.5 + pred_stability_2s * 0.5)
+        success_prob = max(0.0, min(100.0, success_prob))
 
-        overall_risk = max(max_critical_risk, weighted_general_risk)
-        return min(100.0, max(0.0, overall_risk))
+        return {
+            "pred_roll_err_1s": pred_roll_err_1s,
+            "pred_pitch_err_1s": pred_pitch_err_1s,
+            "pred_error_1s": pred_error_1s,
+            "pred_stability_2s": pred_stability_2s,
+            "recovery_success_prob": success_prob
+        }
