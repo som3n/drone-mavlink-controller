@@ -98,7 +98,7 @@ def safety_monitor(master, cfg, flight_start_time, dt=None, hm=None):
                 return
 
         # Predictive checks if digital twin and health monitor are provided
-        if dt is not None and hm is not None:
+        if not bench_test and dt is not None and hm is not None:
             # 1. Predictive battery exhaustion check
             if volts is not None and volts > 1.0:
                 bat_state = dt.predict_battery_state()

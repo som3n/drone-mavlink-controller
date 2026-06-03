@@ -378,6 +378,10 @@ def run_flight(config_path="config/bench_test.yaml"):
         # Disable radio failsafes for testing
         set_parameter(master, "FS_THR_ENABLE", 0)
         set_parameter(master, "FS_OPTIONS", 0)
+        if bench:
+            set_parameter(master, "FS_CRASH_CHECK", 0)
+        else:
+            set_parameter(master, "FS_CRASH_CHECK", 1)
 
         # Set fake GPS Global Origin and Home Position to initialize EKF origin and zero altitude
         log.info("Initializing EKF origin and home position...")
