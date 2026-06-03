@@ -1,5 +1,5 @@
-import time
 from drone_flight import telemetry as telem
+
 
 def test_vehicle_state_initialization():
     state = telem.state
@@ -14,9 +14,10 @@ def test_vehicle_state_initialization():
     assert state.yacc == 0.0
     assert state.zacc == 0.0
 
+
 def test_getters_under_state_updates():
     state = telem.state
-    
+
     with state.lock:
         state.alt = 10.5
         state.climb = 0.5
@@ -61,8 +62,10 @@ def test_telemetry_reader_loop_global_position_int():
     class MockMaster:
         def __init__(self):
             self.messages = [
-                MockMessage('GLOBAL_POSITION_INT', relative_alt=1500), # first sets offset to 1.5m
-                MockMessage('GLOBAL_POSITION_INT', relative_alt=2500), # updates relative alt to 2.5 - 1.5 = 1.0m
+                # First sets offset to 1.5m
+                MockMessage('GLOBAL_POSITION_INT', relative_alt=1500),
+                # Updates relative alt to 2.5 - 1.5 = 1.0m
+                MockMessage('GLOBAL_POSITION_INT', relative_alt=2500),
                 MockMessage('VFR_HUD', climb=0.25)
             ]
 
@@ -101,4 +104,3 @@ def test_telemetry_reader_loop_consecutive_errors():
     telem.telemetry_reader_loop(master, stop_event)
 
     assert abort_mission.is_set()
-

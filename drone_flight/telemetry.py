@@ -2,9 +2,10 @@ import time
 import math
 import threading
 from pymavlink import mavutil
-from drone_flight.logger import log, log_telemetry
+from drone_flight.logger import log
 
 current_throttle = 0.0
+
 
 class VehicleState:
     def __init__(self):
@@ -23,11 +24,12 @@ class VehicleState:
         self.zacc = 0.0
         self.heartbeat_received = False
 
-state = VehicleState()
 
+state = VehicleState()
 
 RC3_MIN = 1100
 RC3_MAX = 1900
+
 
 def pct_to_pwm(pct: float) -> int:
     return int(RC3_MIN + (max(0.0, min(100.0, pct)) / 100.0) * (RC3_MAX - RC3_MIN))
@@ -49,7 +51,6 @@ def send_rc_throttle(master, pct: float, phase="unknown", roll=1500, pitch=1500,
 
 
 def telemetry_reader_loop(master, stop_event):
-    global state
     log.info("Telemetry reader thread started.")
     consecutive_errors = 0
     while not stop_event.is_set():
@@ -102,10 +103,10 @@ def telemetry_reader_loop(master, stop_event):
             if not stop_event.is_set():
                 log.error(f"Telemetry reader error: {e} (consecutive: {consecutive_errors})")
                 if consecutive_errors >= 5:
-                    log.error("Too many consecutive telemetry errors — signaling safety abort and exiting thread.")
-                    from drone_flight.safety_monitor import abort_mission, abort_reason
-                    abort_reason = "telemetry connection dead"
-                    abort_mission.set()
+                    log.error("Too many telemetry errors — aborting and exiting thread.")
+                    from drone_flight import safety_monitor
+                    safety_monitor.abort_reason = "telemetry connection dead"
+                    safety_monitor.abort_mission.set()
                     break
             time.sleep(0.5)
     log.info("Telemetry reader thread exited.")

@@ -66,7 +66,10 @@ def send_throttle_safe(master, target_pct, phase):
 
             # Log a warning if the tilt is significant (>15 degrees)
             if max_tilt > 15.0:
-                log.warning(f"  [TILT WARNING] roll={roll:.1f}° pitch={pitch:.1f}° | Applying correction: Roll={roll_cmd} Pitch={pitch_cmd}")
+                log.warning(
+                    f"  [TILT WARNING] roll={roll:.1f}° pitch={pitch:.1f}° "
+                    f"| Applying correction: Roll={roll_cmd} Pitch={pitch_cmd}"
+                )
 
     telem.send_rc_throttle(master, target_pct, phase, roll=roll_cmd, pitch=pitch_cmd)
 
@@ -130,7 +133,7 @@ def run_flight(config_path="config/bench_test.yaml"):
             if msg and msg.get_type() == 'GLOBAL_POSITION_INT':
                 ekf_alt = msg.alt / 1000.0
                 break
-        
+
         if ekf_alt is None:
             # Fallback to VFR_HUD
             for _ in range(20):
@@ -164,7 +167,8 @@ def run_flight(config_path="config/bench_test.yaml"):
         if volts is not None and volts > 1.0:
             min_volts = fc.get("battery_min_voltage", 10.5)
             if volts < min_volts:
-                log.error(f"Battery check failed: {volts:.2f}V (requires {min_volts}V)"); return
+                log.error(f"Battery check failed: {volts:.2f}V (requires {min_volts}V)")
+                return
             log.info(f"Battery: {volts:.2f}V OK")
         else:
             log.info("No battery detected (or USB powered only) — skipping startup battery check.")
@@ -174,19 +178,28 @@ def run_flight(config_path="config/bench_test.yaml"):
 
         # Start telemetry reader thread
         stop_reader = threading.Event()
-        reader_thread = threading.Thread(target=telem.start_telemetry_reader, args=(master, stop_reader), daemon=True)
+        reader_thread = threading.Thread(
+            target=telem.start_telemetry_reader,
+            args=(master, stop_reader),
+            daemon=True
+        )
         reader_thread.start()
 
         flight_start = time.time()
 
-        monitor = threading.Thread(target=safety_monitor, args=(master, cfg, flight_start), daemon=True)
+        monitor = threading.Thread(
+            target=safety_monitor,
+            args=(master, cfg, flight_start),
+            daemon=True
+        )
         monitor.start()
 
         # ── PHASE 1: Spin-up ──────────────────────────────────
         log.info("PHASE: Spin-up 10% x 5s")
         for _ in range(50):
             if check_abort("spinup"):
-                abort_and_land(master, "spinup"); return
+                abort_and_land(master, "spinup")
+                return
             send_throttle_safe(master, 10, "spinup")
             alt, climb = telem.get_vfr_hud()
             roll, pitch = telem.get_attitude()
@@ -198,7 +211,8 @@ def run_flight(config_path="config/bench_test.yaml"):
             log.info(f"PHASE: Stabilize {pct}% x {hold}s")
             for _ in range(int(hold / 0.1)):
                 if check_abort("stabilize"):
-                    abort_and_land(master, "stabilize"); return
+                    abort_and_land(master, "stabilize")
+                    return
                 send_throttle_safe(master, pct, "stabilize")
                 alt, climb = telem.get_vfr_hud()
                 roll, pitch = telem.get_attitude()
@@ -212,7 +226,8 @@ def run_flight(config_path="config/bench_test.yaml"):
             log.info(f"  Ramp {pct}% x {hold}s")
             for _ in range(int(hold / 0.1)):
                 if check_abort("ramp"):
-                    abort_and_land(master, "ramp"); return
+                    abort_and_land(master, "ramp")
+                    return
                 send_throttle_safe(master, pct, "ramp")
                 alt, climb = telem.get_vfr_hud()
                 roll, pitch = telem.get_attitude()
@@ -223,7 +238,10 @@ def run_flight(config_path="config/bench_test.yaml"):
                         log.debug(f"  alt={alt:.3f}m climb={climb:.3f}m/s @ {pct}%")
                         if alt > fc["liftoff_alt_m"] and climb > fc["liftoff_climb_rate"]:
                             hover_throttle = pct
-                            log.info(f"LIFTOFF DETECTED at {pct}% | alt={alt:.2f}m climb={climb:.2f}m/s")
+                            log.info(
+                                f"LIFTOFF DETECTED at {pct}% | "
+                                f"alt={alt:.2f}m climb={climb:.2f}m/s"
+                            )
 
         if hover_throttle is None:
             hover_throttle = fc["known_hover_throttle_pct"]
@@ -233,7 +251,8 @@ def run_flight(config_path="config/bench_test.yaml"):
         log.info(f"PHASE: Hover {hover_throttle}% x {fc['hover_hold_sec']}s")
         for _ in range(int(fc["hover_hold_sec"] / 0.1)):
             if check_abort("hover"):
-                abort_and_land(master, "hover"); return
+                abort_and_land(master, "hover")
+                return
             send_throttle_safe(master, hover_throttle, "hover")
             alt, climb = telem.get_vfr_hud()
             roll, pitch = telem.get_attitude()
@@ -253,7 +272,8 @@ def run_flight(config_path="config/bench_test.yaml"):
         land_start = time.time()
         while True:
             if check_abort("landing"):
-                abort_and_land(master, "landing"); return
+                abort_and_land(master, "landing")
+                return
 
             # Read and log telemetry
             alt, climb = telem.get_vfr_hud()
@@ -268,7 +288,8 @@ def run_flight(config_path="config/bench_test.yaml"):
                 log.info("Ground confirmed: Disarmed successfully.")
                 break
 
-            # Extra safety timeout: 5s for bench test (no propellers to trigger landing detection), 30s for real flight
+            # Extra safety timeout: 5s for bench test (no propellers to trigger
+            # landing detection), 30s for real flight
             timeout_limit = 5.0 if bench else 30.0
             if time.time() - land_start > timeout_limit:
                 if bench:

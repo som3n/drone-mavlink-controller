@@ -22,7 +22,11 @@ log = logging.getLogger("drone")
 
 _csv_file = open(CSV_FILE, "w", newline="")
 _csv_writer = csv.writer(_csv_file)
-_csv_writer.writerow(["time_s", "phase", "throttle_pct", "alt_m", "climb_mps", "roll_deg", "pitch_deg"])
+_csv_writer.writerow([
+    "time_s", "phase", "throttle_pct", "alt_m", "climb_mps",
+    "roll_deg", "pitch_deg"
+])
+
 
 def log_telemetry(phase, throttle, alt=None, climb=None, roll=None, pitch=None):
     _csv_writer.writerow([
@@ -35,6 +39,7 @@ def log_telemetry(phase, throttle, alt=None, climb=None, roll=None, pitch=None):
         round(pitch, 2) if pitch is not None else "",
     ])
     _csv_file.flush()
+
 
 def close_logger():
     _csv_file.close()
