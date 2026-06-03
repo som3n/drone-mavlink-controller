@@ -7,7 +7,7 @@ abort_mission = threading.Event()
 abort_reason = ""
 
 
-def safety_monitor(master, cfg, flight_start_time):
+def safety_monitor(master, cfg, flight_start_time, dt=None, hm=None):
     global abort_reason
     safety = cfg["safety"]
     log.info("Safety monitor active.")
@@ -59,6 +59,40 @@ def safety_monitor(master, cfg, flight_start_time):
             if volts < min_voltage:
                 log.error(f"ABORT — battery critical {volts:.2f}V (threshold: {min_voltage}V)")
                 abort_reason = f"battery critical {volts:.2f}V"
+                abort_mission.set()
+                return
+
+        # Predictive checks if digital twin and health monitor are provided
+        if dt is not None and hm is not None:
+            # 1. Predictive battery exhaustion check
+            if volts is not None and volts > 1.0:
+                bat_state = dt.predict_battery_state()
+                rem_flight_time = bat_state["remaining_flight_time_sec"]
+                if rem_flight_time < 15.0:
+                    log.error(
+                        f"PREDICTIVE ABORT — Battery expected to deplete "
+                        f"to cutoff in {rem_flight_time:.1f}s"
+                    )
+                    abort_reason = "predictive battery critical"
+                    abort_mission.set()
+                    return
+
+            # 2. Predictive stability failure check (attitude drift / oscillation growth)
+            stability_trends = dt.evaluate_stability_trends()
+            if stability_trends["oscillation_growing"]:
+                risk = dt.get_flight_risk_score()
+                if risk > 80.0:
+                    log.error("PREDICTIVE ABORT — Growing oscillations and high flight risk")
+                    abort_reason = "predictive stability failure"
+                    abort_mission.set()
+                    return
+
+            # 3. Statistical Anomaly Detection check
+            anomalies = hm.detect_anomalies(dt)
+            if anomalies["is_anomaly"] and anomalies["anomaly_score"] >= 80.0:
+                reasons_str = ", ".join(anomalies["reasons"])
+                log.error(f"PREDICTIVE ABORT — Critical statistical anomalies: {reasons_str}")
+                abort_reason = f"anomaly: {reasons_str}"
                 abort_mission.set()
                 return
 

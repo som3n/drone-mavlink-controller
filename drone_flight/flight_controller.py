@@ -3,11 +3,16 @@ import platform
 import threading
 import yaml
 import math
+import json
+import os
+from datetime import datetime
 
 from pymavlink import mavutil
 from drone_flight.logger import log, log_telemetry, close_logger
 from drone_flight import telemetry as telem
 from drone_flight.safety_monitor import safety_monitor, abort_mission
+from drone_flight.digital_twin import DigitalTwin
+from drone_flight.health_monitor import HealthMonitor, std_dev
 
 
 def load_config(path="config/bench_test.yaml"):
@@ -23,23 +28,164 @@ def check_abort(phase):
     return False
 
 
-def abort_and_land(master, reason):
+def abort_and_land(master, reason, bench=True):
     from drone_flight.safety_monitor import abort_reason
     full_reason = f"{reason} | {abort_reason}" if abort_reason else reason
-    log.error(f"EMERGENCY LAND — {full_reason}")
+    log.error(f"EMERGENCY RECOVERY TRIGGERED — {full_reason}")
     reason_lower = full_reason.lower()
-    if "attitude" in reason_lower or "crash" in reason_lower or "imu" in reason_lower:
-        log.warning("CRITICAL ATTITUDE/IMU SAFETY FAULT — DISARMING MOTORS IMMEDIATELY!")
+
+    if ("attitude" in reason_lower or "crash" in reason_lower or
+            "imu" in reason_lower or "user interrupt" in reason_lower):
+        log.warning("CRITICAL SAFETY FAULT — DISARMING MOTORS IMMEDIATELY!")
         telem.send_rc_throttle(master, 0, "emergency")
         telem.disarm(master)
         return
 
-    # Normal landing sequence for other reasons (e.g. telemetry timeout, user exit)
-    for pct in range(int(telem.current_throttle), 0, -5):
-        telem.send_rc_throttle(master, pct, "emergency")
-        time.sleep(0.3)
-    telem.send_rc_throttle(master, 0, "emergency")
-    telem.disarm(master)
+    log.warning("MAJOR FAULT — INITIALIZING CONTROLLED AUTONOMOUS LANDING...")
+    try:
+        master.mav.rc_channels_override_send(
+            master.target_system, master.target_component,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        telem.set_mode(master, "LAND")
+
+        land_start = time.time()
+        timeout_limit = 5.0 if bench else 30.0
+        while time.time() - land_start < timeout_limit:
+            with telem.state.lock:
+                is_armed = telem.state.armed
+            if not is_armed:
+                log.info("Ground confirmed: Disarmed successfully.")
+                return
+            time.sleep(0.2)
+
+        log.warning("Landing timeout exceeded — force-disarming!")
+        telem.disarm(master)
+    except Exception as e:
+        log.error(f"Controlled landing error: {e}. Falling back to manual ramp.")
+        for pct in range(int(telem.current_throttle), 0, -5):
+            telem.send_rc_throttle(master, pct, "emergency")
+            time.sleep(0.3)
+        telem.send_rc_throttle(master, 0, "emergency")
+        telem.disarm(master)
+
+
+def update_and_log_framework(phase, throttle, dt, hm):
+    alt, climb = telem.get_vfr_hud()
+    roll, pitch = telem.get_attitude()
+    xacc, yacc, zacc = telem.get_raw_imu()
+    volts = telem.get_battery_voltage()
+
+    dt.update(alt, climb, volts, roll, pitch, xacc, yacc, zacc)
+
+    health = hm.calculate_health_scores(dt)
+    anomalies = hm.detect_anomalies(dt)
+    anomaly_score = anomalies["anomaly_score"]
+    risk_score = dt.get_flight_risk_score()
+
+    pred_alt_1s = dt.predict_future_altitude(1.0)
+    pred_alt_3s = dt.predict_future_altitude(3.0)
+    pred_alt_5s = dt.predict_future_altitude(5.0)
+
+    bat_state = dt.predict_battery_state()
+    pred_volt_rem = bat_state["remaining_voltage"]
+
+    log_telemetry(
+        phase, throttle, alt, climb, roll, pitch,
+        health=health, anomaly_score=anomaly_score, risk_score=risk_score,
+        pred_alt_1s=pred_alt_1s, pred_alt_3s=pred_alt_3s, pred_alt_5s=pred_alt_5s,
+        pred_volt_rem=pred_volt_rem
+    )
+
+
+def set_parameter(master, name, value, param_type=mavutil.mavlink.MAV_PARAM_TYPE_REAL32):
+    log.info(f"Setting parameter {name} to {value}...")
+    param_name = name.encode('utf-8')
+    try:
+        master.mav.param_set_send(
+            master.target_system,
+            master.target_component,
+            param_name,
+            float(value),
+            param_type
+        )
+    except Exception as e:
+        log.warning(f"Error setting parameter {name}: {e}")
+
+
+def load_learned_params():
+    path = "config/learned_params.json"
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                params = json.load(f)
+                log.info(f"Loaded learned flight parameters: {params}")
+                return params
+        except Exception as e:
+            log.warning(f"Error loading learned parameters: {e}")
+    return {}
+
+
+def save_learned_params(liftoff_th, hover_th, landing_th):
+    os.makedirs("config", exist_ok=True)
+    path = "config/learned_params.json"
+    params = {
+        "liftoff_throttle": int(liftoff_th),
+        "hover_throttle": int(hover_th),
+        "landing_throttle": int(landing_th)
+    }
+    try:
+        with open(path, "w") as f:
+            json.dump(params, f, indent=4)
+        log.info(f"Saved learned flight parameters to {path}: {params}")
+    except Exception as e:
+        log.warning(f"Error saving learned parameters: {e}")
+
+
+def generate_post_flight_report(flight_start, dt, hover_altitudes_list):
+    duration = time.time() - flight_start
+    altitudes = dt.history["alt"]
+    climbs = dt.history["climb"]
+    rolls = dt.history["roll"]
+    pitches = dt.history["pitch"]
+    voltages = dt.history["voltage"]
+
+    max_alt = max(altitudes) if altitudes else 0.0
+    avg_climb = sum(climbs) / len(climbs) if climbs else 0.0
+    max_roll = max(abs(r) for r in rolls) if rolls else 0.0
+    max_pitch = max(abs(p) for p in pitches) if pitches else 0.0
+
+    hover_stability = std_dev(hover_altitudes_list) if hover_altitudes_list else 0.0
+
+    bat_used = 0.0
+    if voltages and voltages[0] > 1.0:
+        bat_used = max(0.0, voltages[0] - voltages[-1])
+
+    report = (
+        f"==================================================\n"
+        f"                FLIGHT ANALYTICS REPORT           \n"
+        f"==================================================\n"
+        f"Flight Duration:         {duration:.1f}s\n"
+        f"Maximum Altitude:        {max_alt:.2f}m\n"
+        f"Average Climb Rate:      {avg_climb:.2f} m/s\n"
+        f"Hover Stability (StdDev): {hover_stability:.3f}m\n"
+        f"Maximum Roll:            {max_roll:.1f}°\n"
+        f"Maximum Pitch:           {max_pitch:.1f}°\n"
+        f"Battery Consumed:        {bat_used:.2f}V\n"
+        f"==================================================\n"
+    )
+
+    log.info("\n" + report)
+
+    try:
+        os.makedirs("logs", exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = f"logs/{timestamp}_report.txt"
+        with open(report_path, "w") as f:
+            f.write(report)
+        log.info(f"Saved flight analytics report to {report_path}")
+    except Exception as e:
+        log.warning(f"Error saving flight analytics report: {e}")
 
 
 def send_throttle_safe(master, target_pct, phase):
@@ -79,6 +225,16 @@ def run_flight(config_path="config/bench_test.yaml"):
     fc = cfg["flight"]
     bench = cfg["bench_test"]
 
+    dt = DigitalTwin(update_rate_hz=10)
+    hm = HealthMonitor()
+
+    # Load learned parameters
+    learned = load_learned_params()
+    learned_hover = learned.get("hover_throttle")
+    if learned_hover is not None:
+        fc["known_hover_throttle_pct"] = learned_hover
+        log.info(f"Overriding known hover throttle with learned value: {learned_hover}%")
+
     log.info(f"Platform: {platform.system()} | Mode: {'BENCH TEST' if bench else 'REAL FLIGHT'}")
 
     port = cfg["port"]["windows"] if platform.system() == "Windows" else cfg["port"]["linux"]
@@ -111,6 +267,10 @@ def run_flight(config_path="config/bench_test.yaml"):
             mavutil.mavlink.MAV_DATA_STREAM_POSITION, 10, 1  # VFR_HUD / GLOBAL_POSITION_INT
         )
         time.sleep(1)
+
+        # Disable radio failsafes for testing
+        set_parameter(master, "FS_THR_ENABLE", 0)
+        set_parameter(master, "FS_OPTIONS", 0)
 
         # Set fake GPS Global Origin and Home Position to initialize EKF origin and zero altitude
         log.info("Initializing EKF origin and home position...")
@@ -189,7 +349,7 @@ def run_flight(config_path="config/bench_test.yaml"):
 
         monitor = threading.Thread(
             target=safety_monitor,
-            args=(master, cfg, flight_start),
+            args=(master, cfg, flight_start, dt, hm),
             daemon=True
         )
         monitor.start()
@@ -198,12 +358,10 @@ def run_flight(config_path="config/bench_test.yaml"):
         log.info("PHASE: Spin-up 10% x 5s")
         for _ in range(50):
             if check_abort("spinup"):
-                abort_and_land(master, "spinup")
+                abort_and_land(master, "spinup", bench)
                 return
             send_throttle_safe(master, 10, "spinup")
-            alt, climb = telem.get_vfr_hud()
-            roll, pitch = telem.get_attitude()
-            log_telemetry("spinup", 10, alt, climb, roll, pitch)
+            update_and_log_framework("spinup", 10, dt, hm)
             time.sleep(0.1)
 
         # ── PHASE 2: Pre-lift stabilize ───────────────────────
@@ -211,52 +369,74 @@ def run_flight(config_path="config/bench_test.yaml"):
             log.info(f"PHASE: Stabilize {pct}% x {hold}s")
             for _ in range(int(hold / 0.1)):
                 if check_abort("stabilize"):
-                    abort_and_land(master, "stabilize")
+                    abort_and_land(master, "stabilize", bench)
                     return
                 send_throttle_safe(master, pct, "stabilize")
-                alt, climb = telem.get_vfr_hud()
-                roll, pitch = telem.get_attitude()
-                log_telemetry("stabilize", pct, alt, climb, roll, pitch)
+                update_and_log_framework("stabilize", pct, dt, hm)
                 time.sleep(0.1)
 
         # ── PHASE 3: Takeoff ramp ─────────────────────────────
         log.info("PHASE: Takeoff ramp")
         hover_throttle = None
+        liftoff_counter = 0
+
         for pct, hold in cfg["takeoff_ramp"]:
             log.info(f"  Ramp {pct}% x {hold}s")
             for _ in range(int(hold / 0.1)):
                 if check_abort("ramp"):
-                    abort_and_land(master, "ramp")
+                    abort_and_land(master, "ramp", bench)
                     return
                 send_throttle_safe(master, pct, "ramp")
-                alt, climb = telem.get_vfr_hud()
-                roll, pitch = telem.get_attitude()
-                log_telemetry("ramp", pct, alt, climb, roll, pitch)
+                update_and_log_framework("ramp", pct, dt, hm)
                 time.sleep(0.1)
                 if hover_throttle is None and pct >= 30:
+                    alt, climb = telem.get_vfr_hud()
                     if alt is not None and climb is not None:
-                        log.debug(f"  alt={alt:.3f}m climb={climb:.3f}m/s @ {pct}%")
                         if alt > fc["liftoff_alt_m"] and climb > fc["liftoff_climb_rate"]:
+                            liftoff_counter += 1
+                        else:
+                            liftoff_counter = 0
+
+                        if liftoff_counter >= 10:  # 1.0s persistence check
                             hover_throttle = pct
                             log.info(
                                 f"LIFTOFF DETECTED at {pct}% | "
                                 f"alt={alt:.2f}m climb={climb:.2f}m/s"
                             )
+                            break
+            if hover_throttle is not None:
+                break
 
         if hover_throttle is None:
             hover_throttle = fc["known_hover_throttle_pct"]
-            log.warning(f"Liftoff not detected — using known hover throttle {hover_throttle}%")
+            log.warning(f"Liftoff not detected — using hover throttle {hover_throttle}%")
 
         # ── PHASE 4: Hover ────────────────────────────────────
-        log.info(f"PHASE: Hover {hover_throttle}% x {fc['hover_hold_sec']}s")
+        target_alt = fc.get("target_altitude_m", fc.get("liftoff_alt_m", 0.10) + 0.15)
+        kp = fc.get("hover_kp", 15.0)
+        log.info(
+            f"PHASE: Hover (Target: {target_alt:.2f}m) "
+            f"using base {hover_throttle}% x {fc['hover_hold_sec']}s"
+        )
+        hover_throttles_list = []
+        hover_altitudes_list = []
+
         for _ in range(int(fc["hover_hold_sec"] / 0.1)):
             if check_abort("hover"):
-                abort_and_land(master, "hover")
+                abort_and_land(master, "hover", bench)
                 return
-            send_throttle_safe(master, hover_throttle, "hover")
+
             alt, climb = telem.get_vfr_hud()
-            roll, pitch = telem.get_attitude()
-            log_telemetry("hover", hover_throttle, alt, climb, roll, pitch)
+            error = target_alt - (alt if alt is not None else 0.0)
+            cmd_throttle = hover_throttle + kp * error
+            cmd_throttle = int(max(15.0, min(60.0, cmd_throttle)))
+
+            hover_throttles_list.append(cmd_throttle)
+            if alt is not None:
+                hover_altitudes_list.append(alt)
+
+            send_throttle_safe(master, cmd_throttle, "hover")
+            update_and_log_framework("hover", cmd_throttle, dt, hm)
             time.sleep(0.1)
 
         # ── PHASE 5: Land Mode ────────────────────────────────
@@ -272,13 +452,10 @@ def run_flight(config_path="config/bench_test.yaml"):
         land_start = time.time()
         while True:
             if check_abort("landing"):
-                abort_and_land(master, "landing")
+                abort_and_land(master, "landing", bench)
                 return
 
-            # Read and log telemetry
-            alt, climb = telem.get_vfr_hud()
-            roll, pitch = telem.get_attitude()
-            log_telemetry("land", 0, alt, climb, roll, pitch)
+            update_and_log_framework("land", 0, dt, hm)
 
             # Check if disarmed
             with telem.state.lock:
@@ -303,15 +480,23 @@ def run_flight(config_path="config/bench_test.yaml"):
 
         log.info("Flight sequence complete.")
 
+        # Generate post-flight report
+        generate_post_flight_report(flight_start, dt, hover_altitudes_list)
+
+        # Save learned parameters
+        if hover_throttle is not None and hover_throttles_list:
+            learned_hover = int(sum(hover_throttles_list) / len(hover_throttles_list))
+            save_learned_params(hover_throttle, learned_hover, fc.get("land_final_throttle", 10))
+
     except KeyboardInterrupt:
         log.warning("Ctrl+C — emergency landing.")
         abort_mission.set()
-        abort_and_land(master, "user interrupt")
+        abort_and_land(master, "user interrupt", bench)
 
     except Exception as e:
         log.error(f"Exception: {e}")
         abort_mission.set()
-        abort_and_land(master, str(e))
+        abort_and_land(master, str(e), bench)
         raise
 
     finally:
