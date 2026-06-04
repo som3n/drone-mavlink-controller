@@ -4,27 +4,34 @@ def calculate_recovery_command(target, actual, rate, kp_base, kd_base):
     error = target - actual
     max_err = abs(error)
 
-    # Zone-based gains
+    # Zone-based gains and authority factor matching production code
     if max_err <= 5.0:
-        kp_factor, kd_factor = 0.0, 0.0
+        auth_factor = 0.0
+        KP = kp_base
+        KD = kd_base
         state = "NORMAL"
     elif max_err <= 10.0:
-        kp_factor, kd_factor = 0.5, 0.5
+        auth_factor = 0.25
+        KP = kp_base
+        KD = kd_base
         state = "MINOR CORRECTION"
     elif max_err <= 20.0:
-        kp_factor, kd_factor = 1.0, 1.0
+        auth_factor = 0.50
+        KP = kp_base
+        KD = kd_base
         state = "ACTIVE RECOVERY"
     elif max_err <= 35.0:
-        kp_factor, kd_factor = 1.5, 1.0
+        auth_factor = 0.75
+        KP = kp_base
+        KD = kd_base
         state = "HIGH RECOVERY"
     else:
-        kp_factor, kd_factor = 2.0, 1.0
+        auth_factor = 1.00
+        KP = kp_base
+        KD = kd_base
         state = "RECOVERY MODE"
 
-    KP = kp_base * kp_factor
-    KD = kd_base * kd_factor
-
-    corr = KP * error - KD * rate
+    corr = (KP * error - KD * rate) * auth_factor
     corr = max(-200.0, min(200.0, corr))
     cmd = int(1500 + corr)
 
@@ -67,10 +74,10 @@ def test_zone_3_active_recovery():
         target=15.0, actual=0.0, rate=2.0, kp_base=8.0, kd_base=1.5
     )
     assert state == "ACTIVE RECOVERY"
-    # KP = 8 * 1.0 = 8.0, KD = 1.5 * 1.0 = 1.5
-    # corr = 8.0 * 15 - 1.5 * 2.0 = 120 - 3 = 117
-    assert abs(corr - 117.0) < 1e-3
-    assert cmd == 1617
+    # KP = 8, KD = 1.5, auth_factor = 0.50
+    # corr = (8.0 * 15 - 1.5 * 2.0) * 0.5 = (120 - 3) * 0.5 = 58.5
+    assert abs(corr - 58.5) < 1e-3
+    assert cmd == 1558
 
 
 def test_zone_5_recovery_mode_clamp():

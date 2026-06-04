@@ -65,14 +65,20 @@ def evaluate_recovery_performance(event_data):
     success = event_data.get("success", False)
     recoverable = event_data.get("recoverable", True)
 
-    # 1. Quality scoring formula
-    recovery_score = (duration * 0.5) + (overshoot * 0.3) + (stability_score * 0.2)
+    # 1. Quality scoring formula (all metrics normalized to 0-100 scale)
+    duration_norm = min(100.0, (duration / 5.0) * 100.0)
+    overshoot_norm = min(100.0, (overshoot / 15.0) * 100.0)
+    stability_norm = min(100.0, stability_score)
 
-    if recovery_score <= 5.0:
-        quality = "Excellent"
-    elif recovery_score <= 10.0:
-        quality = "Good"
+    recovery_score = (duration_norm * 0.4) + (overshoot_norm * 0.3) + (stability_norm * 0.3)
+
+    if not success:
+        quality = "Failed"
     elif recovery_score <= 20.0:
+        quality = "Excellent"
+    elif recovery_score <= 40.0:
+        quality = "Good"
+    elif recovery_score <= 65.0:
         quality = "Fair"
     else:
         quality = "Poor"
@@ -97,10 +103,8 @@ def evaluate_recovery_performance(event_data):
 
         if recoverable:
             # Rule-based adaptation rules
-            # Rule 4: Excellent recovery — no change
-            is_excellent = duration < 1.0 and overshoot < 2.0 and stability_score < 15.0
-
-            if not is_excellent:
+            # Excellent quality recovery — skip all gain changes
+            if quality != "Excellent":
                 # Rule 1: Slow Recovery
                 if duration > 2.5:
                     kp_new += 0.10
@@ -123,19 +127,31 @@ def evaluate_recovery_performance(event_data):
             kp_new = round(max(KP_MIN, min(KP_MAX, kp_new)), 3)
             kd_new = round(max(KD_MIN, min(KD_MAX, kd_new)), 3)
 
-            # Update database values
+            # Update database values (only increment samples when gains actually changed)
+            gains_changed = (kp_new != kp_old or kd_new != kd_old)
             learning_data[zone_key]["kp"] = kp_new
             learning_data[zone_key]["kd"] = kd_new
-            learning_data[zone_key]["samples"] += 1
+            if gains_changed:
+                learning_data[zone_key]["samples"] += 1
             save_controller_learning(learning_data)
 
-            if kp_new != kp_old or kd_new != kd_old:
+            if gains_changed:
                 log.info(
                     f"  [LEARNING UPDATE] Optimized {zone_key} gains: "
                     f"KP: {kp_old} -> {kp_new} | KD: {kd_old} -> {kd_new}"
                 )
         else:
             log.info("  [RECOVERY LEARNING] Bench test mode: skipping parameter adaptation updates.")
+
+    # Determine learning status
+    if not recoverable:
+        learning_status = "SKIPPED"
+    elif quality == "Excellent":
+        learning_status = "EXCELLENT_NO_CHANGE"
+    elif kp_new != kp_old or kd_new != kd_old:
+        learning_status = "LEARNED"
+    else:
+        learning_status = "NO_CHANGE"
 
     # 3. CSV Dataset logging for future research
     try:
@@ -146,7 +162,8 @@ def evaluate_recovery_performance(event_data):
             if write_header:
                 writer.writerow([
                     "timestamp", "zone", "kp", "kd", "duration", "overshoot",
-                    "stability_score", "authority_factor", "success"
+                    "stability_score", "authority_factor", "success",
+                    "recoverable", "quality", "recovery_score", "learning_status"
                 ])
             writer.writerow([
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -157,7 +174,11 @@ def evaluate_recovery_performance(event_data):
                 round(overshoot, 2),
                 round(stability_score, 2),
                 round(auth_factor, 2),
-                "BENCH_VALIDATION" if not recoverable else success
+                "BENCH_VALIDATION" if not recoverable else success,
+                recoverable,
+                quality,
+                round(recovery_score, 2),
+                learning_status
             ])
     except Exception as e:
         log.warning(f"Failed to log recovery learning event to CSV: {e}")
@@ -167,5 +188,5 @@ def evaluate_recovery_performance(event_data):
         "quality": quality,
         "kp": kp_new,
         "kd": kd_new,
-        "learning_status": "SKIPPED" if not recoverable else "LEARNED"
+        "learning_status": learning_status
     }

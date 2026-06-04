@@ -115,7 +115,7 @@ def test_oscillation_rule():
 
 
 def test_excellent_recovery_no_change():
-    # Rule 4: excellent recovery -> no change
+    # Excellent quality recovery -> no gain change, no sample increment
     event_data = {
         "zone": 3,
         "duration": 0.5,
@@ -128,6 +128,11 @@ def test_excellent_recovery_no_change():
     res = evaluate_recovery_performance(event_data)
     assert abs(res["kp"] - 8.0) < 1e-3
     assert abs(res["kd"] - 1.5) < 1e-3
+    assert res["learning_status"] == "EXCELLENT_NO_CHANGE"
+
+    # Samples must NOT increment for excellent recoveries (Issue 3 fix)
+    data = load_controller_learning()
+    assert data["zone3"]["samples"] == 0
 
 
 def test_gain_clamping():
@@ -204,3 +209,86 @@ def test_bench_validation_no_learning():
         assert last_row[2] == "8.0"
         assert last_row[3] == "1.5"
         assert last_row[8] == "BENCH_VALIDATION"
+        # New CSV columns (Issue 5 fix)
+        assert last_row[9] == "False"   # recoverable
+        assert last_row[10] == "Failed"  # quality (success=False -> Failed)
+        assert last_row[12] == "SKIPPED"  # learning_status
+
+
+def test_no_dual_excellent_definition():
+    """Issue 1 fix: A slow recovery must NOT be labeled 'Excellent'
+    even if the old raw score formula would have scored it low.
+
+    With the old formula: score = 3.0*0.5 + 0*0.3 + 0*0.2 = 1.5 -> 'Excellent'
+    With the new normalized formula: duration_norm = 60.0 -> score = 24.0 -> 'Good'
+    """
+    event_data = {
+        "zone": 3,
+        "duration": 3.0,
+        "overshoot": 0.0,
+        "stability_score": 0.0,
+        "authority_factor": 0.5,
+        "success": True
+    }
+
+    res = evaluate_recovery_performance(event_data)
+    # Must NOT be Excellent — 3 seconds is not excellent
+    assert res["quality"] != "Excellent"
+    # Rule 1 must fire: duration > 2.5 -> KP += 0.10
+    assert abs(res["kp"] - 8.10) < 1e-3
+    assert res["learning_status"] == "LEARNED"
+
+
+def test_samples_only_increment_on_gain_change():
+    """Issue 3 fix: samples must NOT increment when gains are unchanged."""
+    # Excellent recovery: gains should not change, samples stays 0
+    excellent_event = {
+        "zone": 3,
+        "duration": 0.3,
+        "overshoot": 0.5,
+        "stability_score": 5.0,
+        "authority_factor": 0.5,
+        "success": True
+    }
+
+    for _ in range(10):
+        res = evaluate_recovery_performance(excellent_event)
+
+    assert abs(res["kp"] - 8.0) < 1e-3
+    assert abs(res["kd"] - 1.5) < 1e-3
+    data = load_controller_learning()
+    assert data["zone3"]["samples"] == 0  # No changes -> no sample increment
+
+    # Now trigger a real gain change -> samples should increment
+    slow_event = {
+        "zone": 3,
+        "duration": 3.0,
+        "overshoot": 1.0,
+        "stability_score": 10.0,
+        "authority_factor": 0.5,
+        "success": True
+    }
+
+    res = evaluate_recovery_performance(slow_event)
+    data = load_controller_learning()
+    assert data["zone3"]["samples"] == 1  # One real change -> samples = 1
+
+
+def test_failed_recovery_quality_label():
+    """Issue 6 fix: Failed recoveries must get quality = 'Failed',
+    not 'Excellent' based on a misleading score."""
+    event_data = {
+        "zone": 3,
+        "duration": 5.0,
+        "overshoot": 0.0,
+        "stability_score": 0.0,
+        "authority_factor": 0.5,
+        "success": False  # Recovery timed out
+    }
+
+    res = evaluate_recovery_performance(event_data)
+    assert res["quality"] == "Failed"
+    # Gains should still update since recoverable defaults to True
+    assert abs(res["kp"] - 8.10) < 1e-3  # duration > 2.5 -> KP += 0.10
+    assert res["learning_status"] == "LEARNED"
+
