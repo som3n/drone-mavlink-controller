@@ -4,7 +4,11 @@ import threading
 import yaml
 import json
 import os
+import sys
 from datetime import datetime
+
+# Add the project root directory to sys.path to allow running the script directly
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from pymavlink import mavutil
 from drone_flight.logger import log, log_telemetry, close_logger
@@ -825,6 +829,39 @@ def run_flight(config_path="config/bench_test.yaml"):
             update_and_log_framework("hover", cmd_throttle, dt, hm)
             time.sleep(0.1)
 
+        # Check if recovery is active before transitioning to Land Mode
+        with telem.state.lock:
+            active_recovery = telem.state.active_recovery_event is not None
+
+        if active_recovery:
+            log.warning("PHASE transition delayed: active attitude recovery in progress. Holding hover altitude...")
+            recovery_wait_start = time.time()
+            while True:
+                with telem.state.lock:
+                    active_recovery = telem.state.active_recovery_event is not None
+
+                if not active_recovery:
+                    log.info("Attitude recovery complete. Proceeding to Land Mode.")
+                    break
+
+                if time.time() - recovery_wait_start > 5.0:
+                    log.warning("Attitude recovery wait timed out. Proceeding to Land Mode.")
+                    break
+
+                if check_abort("recovery_wait"):
+                    abort_and_land(master, "recovery_wait", bench)
+                    return
+
+                # Continue sending recovery commands during wait
+                alt, climb = telem.get_vfr_hud()
+                error = target_alt - (alt if alt is not None else 0.0)
+                cmd_throttle = hover_throttle + kp * error
+                cmd_throttle = int(max(15.0, min(60.0, cmd_throttle)))
+
+                send_throttle_safe(master, cmd_throttle, "recovery_hold", dt, bench=bench)
+                update_and_log_framework("recovery_hold", cmd_throttle, dt, hm)
+                time.sleep(0.1)
+
         # ── PHASE 5: Land Mode ────────────────────────────────
         log.info("PHASE: Initializing autonomous LAND mode...")
         # Clear RC overrides to return control to the autopilot
@@ -896,6 +933,19 @@ def run_flight(config_path="config/bench_test.yaml"):
 
 
 if __name__ == "__main__":
+    import os
     import sys
-    config_file = sys.argv[1] if len(sys.argv) > 1 else "config/bench_test.yaml"
+    
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    
+    if len(sys.argv) > 1:
+        # User specified custom config path, resolve it relative to current CWD
+        config_file = os.path.abspath(sys.argv[1])
+    else:
+        # Use default config file under the project root
+        config_file = os.path.join(project_root, "config", "bench_test.yaml")
+        
+    # Change working directory to project root to keep logs/ and config/ references consistent
+    os.chdir(project_root)
+    
     run_flight(config_file)
